@@ -1,0 +1,5 @@
+# Dependencias para ejecutar las pruebas automáticas (pytest)
+-r requirements.txt
+pytest>=8
+httpx2>=2     # cliente de pruebas de Starlette 1.x
+httpx>=0.27   # cliente de pruebas de versiones anteriores de Starlette

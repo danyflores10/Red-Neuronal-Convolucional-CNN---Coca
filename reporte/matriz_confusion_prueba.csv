@@ -1,0 +1,11 @@
+,Choqueta,Hoja Normal,Pacena,comun,hoja_especial,machuqe,mediana_grande,mediana_normal,no_es_coca,segunda
+Choqueta,1,0,0,0,0,0,0,0,0,0
+Hoja Normal,0,1,0,0,0,0,0,0,0,0
+Pacena,0,0,5,0,0,0,0,0,0,0
+comun,0,0,0,1,0,0,0,0,0,0
+hoja_especial,0,0,0,0,1,0,0,0,0,0
+machuqe,0,0,1,0,0,1,0,0,0,0
+mediana_grande,0,0,0,0,0,0,1,0,0,0
+mediana_normal,0,0,0,0,0,0,0,1,0,0
+no_es_coca,0,0,0,0,0,0,0,0,2,0
+segunda,0,0,0,0,0,0,0,0,0,1

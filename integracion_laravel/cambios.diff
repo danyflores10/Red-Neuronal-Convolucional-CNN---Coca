@@ -1,0 +1,2283 @@
+diff --git a/app/Http/Controllers/CocaReconocimientoController.php b/app/Http/Controllers/CocaReconocimientoController.php
+index 37db422..c4fba99 100644
+--- a/app/Http/Controllers/CocaReconocimientoController.php
++++ b/app/Http/Controllers/CocaReconocimientoController.php
+@@ -5,10 +5,16 @@
+ use App\Services\CocaClassifierService;
+ use Illuminate\Http\Request;
+ use Illuminate\Http\JsonResponse;
++use Illuminate\Support\Facades\Validator;
+ use Illuminate\View\View;
+ 
+ class CocaReconocimientoController extends Controller
+ {
++    /**
++     * Fotos de la misma hoja que se envían en cada análisis (la vista toma 5)
++     */
++    protected const MAX_FOTOS = 5;
++
+     protected CocaClassifierService $classifier;
+ 
+     public function __construct(CocaClassifierService $classifier)
+@@ -21,57 +27,72 @@ public function __construct(CocaClassifierService $classifier)
+      */
+     public function index(): View
+     {
+-        $clases = $this->classifier->obtenerClases();
+         $estado = $this->classifier->verificarEstado();
++        $apiActiva = ($estado['servidor'] ?? 'inactivo') === 'activo';
++        // Con la API apagada no se pide nada más: en Windows cada intento fallido tarda ~2 s
++        $clases = $apiActiva ? $this->classifier->obtenerClases() : [];
+ 
+         return view('pages.coca-reconocimiento.index', [
+             'clases' => $clases['clases'] ?? [],
+             'descripciones' => $clases['descripcion'] ?? [],
+-            'apiActiva' => ($estado['servidor'] ?? 'inactivo') === 'activo',
++            'apiActiva' => $apiActiva,
+             'estadoApi' => $estado,
+         ]);
+     }
+ 
+     /**
+-     * Analizar imagen mediante la API externa (AJAX)
++     * Analizar las fotos de la hoja mediante la API de reconocimiento (AJAX)
+      */
+     public function analizar(Request $request): JsonResponse
+     {
+-        $request->validate([
+-            'imagen' => ['required', 'image', 'mimes:jpeg,png,jpg,webp', 'max:10240'], // Max 10MB
++        $validador = Validator::make($request->all(), [
++            'imagenes' => ['required_without:imagen', 'array', 'min:1', 'max:' . self::MAX_FOTOS],
++            'imagenes.*' => ['bail', 'image', 'mimes:jpeg,png,jpg,webp', 'max:10240'], // Max 10MB por foto
++            'imagen' => ['bail', 'required_without:imagenes', 'image', 'mimes:jpeg,png,jpg,webp', 'max:10240'],
+         ], [
+-            'imagen.required' => 'Debes seleccionar una imagen para analizar.',
++            'imagenes.required_without' => 'Toma al menos una foto de la hoja para analizar.',
++            'imagenes.array' => 'Las fotos no llegaron en el formato esperado.',
++            'imagenes.max' => 'Puedes enviar como máximo :max fotos por análisis.',
++            'imagenes.*.image' => 'Una de las capturas no es una imagen válida.',
++            'imagenes.*.mimes' => 'Solo se permiten imágenes JPG, PNG o WEBP.',
++            'imagenes.*.max' => 'Cada foto debe pesar menos de 10MB.',
++            'imagen.required_without' => 'Debes seleccionar una imagen para analizar.',
+             'imagen.image' => 'El archivo debe ser una imagen válida.',
+             'imagen.mimes' => 'Solo se permiten imágenes JPG, PNG o WEBP.',
+             'imagen.max' => 'La imagen no debe superar los 10MB.',
+         ]);
+ 
+-        $resultado = $this->classifier->clasificarImagen($request->file('imagen'));
++        // Un solo mensaje claro para la vista, sin el "(and 1 more error)" que Laravel agrega en inglés
++        if ($validador->fails()) {
++            return response()->json([
++                'success' => false,
++                'message' => $validador->errors()->first(),
++                'errors' => $validador->errors(),
++            ], 422);
++        }
++
++        $fotos = $request->file('imagenes') ?: [$request->file('imagen')];
++        $resultado = $this->classifier->analizarImagenes($fotos);
+ 
+-        // Adaptar respuesta para la UI existente
+-        if (isset($resultado['status']) && $resultado['status'] === 'success') {
++        if (($resultado['status'] ?? null) === 'success') {
+             return response()->json([
+                 'success' => true,
+                 'resultado' => $this->adaptarResultadoParaUI($resultado),
+             ]);
+         }
+ 
+-        // Si la API está inactiva, mostrar modo demo
+-        if (isset($resultado['servidor']) && $resultado['servidor'] === 'inactivo') {
+-            return response()->json([
+-                'success' => false,
+-                'message' => $resultado['message'] ?? 'Servicio no disponible',
+-                'demo_mode' => true,
+-                'resultado' => $this->resultadoDemo(),
+-            ], 503);
+-        }
++        // Servicio caído o sin modelo cargado: 503. Foto rechazada por la API: 422. Otro fallo: 502.
++        $httpApi = (int) ($resultado['http_status'] ?? 0);
++        $codigo = match (true) {
++            ($resultado['servidor'] ?? null) === 'inactivo', $httpApi === 503 => 503,
++            in_array($httpApi, [413, 422], true) => 422,
++            default => 502,
++        };
+ 
+         return response()->json([
+             'success' => false,
+-            'message' => $resultado['message'] ?? 'Error al procesar la imagen',
+-            'demo_mode' => true,
+-            'resultado' => $this->resultadoDemo(),
+-        ], 422);
++            'message' => $resultado['message'] ?? 'No se pudo analizar la hoja. Intenta nuevamente.',
++        ], $codigo);
+     }
+ 
+     /**
+@@ -115,138 +136,57 @@ public function apiHealth(): JsonResponse
+     }
+ 
+     /**
+-     * Adaptar el resultado de la API al formato esperado por la UI
++     * Adaptar el resultado de la API al formato que dibuja la vista
+      */
+     protected function adaptarResultadoParaUI(array $resultado): array
+     {
++        // Valores 0-1 de la API a porcentaje (null si la API no los envía)
++        $porcentaje = fn ($valor) => is_numeric($valor) ? round(((float) $valor) * 100, 1) : null;
++
++        $porFoto = array_map(function (array $foto) use ($porcentaje) {
++            $mapa = $foto['mapa_atencion'] ?? null;
++            $calidad = is_array($foto['calidad'] ?? null) ? $foto['calidad'] : [];
++
++            return [
++                'indice' => $foto['indice'] ?? null,
++                'clase' => $foto['clase'] ?? '',
++                'confianza' => $porcentaje($foto['confianza'] ?? 0),
++                'coincide' => (bool) ($foto['coincide_con_resultado'] ?? false),
++                'es_hoja_de_coca' => (bool) ($foto['es_hoja_de_coca'] ?? true),
++                'fuera_de_distribucion' => (bool) ($foto['fuera_de_distribucion'] ?? false),
++                // Las 3 clases más probables de esta foto, en %
++                'top' => array_map(fn ($t) => [
++                    'nombre' => (string) ($t['nombre'] ?? ''),
++                    'probabilidad' => $porcentaje($t['probabilidad'] ?? 0),
++                ], array_slice(array_filter($foto['top'] ?? [], 'is_array'), 0, 3)),
++                'similitud' => $porcentaje($foto['similitud_dataset'] ?? null),
++                'iluminacion' => $porcentaje($calidad['iluminacion'] ?? null),
++                'nitidez' => $porcentaje($calidad['nitidez'] ?? null),
++                'advertencias' => array_values(array_filter($calidad['advertencias'] ?? [], 'is_string')),
++                // Mapa de atención (Grad-CAM) de la red: solo se acepta una imagen JPEG embebida
++                'mapa_atencion' => is_string($mapa) && str_starts_with($mapa, 'data:image/jpeg;base64,') ? $mapa : null,
++            ];
++        }, array_values(array_filter($resultado['por_imagen'] ?? [], 'is_array')));
++
+         return [
++            'estado' => $resultado['estado'] ?? 'no_concluyente',
++            'es_hoja_de_coca' => (bool) ($resultado['es_hoja_de_coca'] ?? true),
++            'mensaje' => $resultado['mensaje'] ?? '',
++            'explicacion' => $resultado['explicacion'] ?? '',
+             'tipo' => $resultado['clase'] ?? $resultado['tipo'] ?? 'No identificado',
+-            'variedad' => $resultado['descripcion'] ?? '',
+-            'calidad_estimada' => $this->determinarCalidad($resultado),
+-            'confianza' => $resultado['confianza'] ?? 0,
+-            'caracteristicas' => $this->extraerCaracteristicas($resultado),
+-            'recomendaciones' => $this->generarRecomendaciones($resultado),
++            'descripcion' => $resultado['descripcion'] ?? '',
++            'confianza' => (float) ($resultado['confianza'] ?? 0),
+             'probabilidades' => $resultado['probabilidades'] ?? [],
++            'metricas' => $resultado['metricas'] ?? [],
++            'por_imagen' => $porFoto,
++            'recomendaciones' => $resultado['recomendaciones'] ?? [],
++            'advertencias' => $resultado['advertencias'] ?? [],
++            'imagenes_analizadas' => $resultado['imagenes_analizadas'] ?? count($porFoto),
+             'tiempo_proceso' => $resultado['tiempo_proceso'] ?? null,
+-            'nota' => null,
+-        ];
+-    }
+-
+-    /**
+-     * Determinar calidad basada en la clasificación
+-     */
+-    protected function determinarCalidad(array $resultado): string
+-    {
+-        $clase = strtolower($resultado['clase'] ?? '');
+-        $confianza = $resultado['confianza'] ?? 0;
+-
+-        // Mapeo de clases a calidades
+-        $calidadMap = [
+-            'primera' => 'Primera (Premium)',
+-            'segunda' => 'Segunda (Estándar)',
+-            'tercera' => 'Tercera (Básica)',
+-            'quispiñu' => 'Quispiñu (Especial)',
+-            'chapi' => 'Chapi',
+-        ];
+-
+-        foreach ($calidadMap as $key => $value) {
+-            if (str_contains($clase, $key)) {
+-                return $value;
+-            }
+-        }
+-
+-        if ($confianza >= 80) return 'Alta';
+-        if ($confianza >= 60) return 'Media';
+-        return 'Por verificar';
+-    }
+-
+-    /**
+-     * Extraer características del resultado
+-     */
+-    protected function extraerCaracteristicas(array $resultado): array
+-    {
+-        $caracteristicas = [];
+-
+-        if (isset($resultado['clase'])) {
+-            $caracteristicas['Clasificación'] = $resultado['clase'];
+-        }
+-
+-        if (isset($resultado['confianza'])) {
+-            $caracteristicas['Confianza'] = $resultado['confianza'] . '%';
+-        }
+-
+-        if (isset($resultado['tiempo_proceso'])) {
+-            $caracteristicas['Tiempo de análisis'] = number_format($resultado['tiempo_proceso'], 3) . 's';
+-        }
+-
+-        // Si hay probabilidades, mostrar las principales
+-        if (isset($resultado['probabilidades']) && is_array($resultado['probabilidades'])) {
+-            $probs = $resultado['probabilidades'];
+-            arsort($probs);
+-            $top3 = array_slice($probs, 0, 3, true);
+-            foreach ($top3 as $clase => $prob) {
+-                $caracteristicas["Prob. {$clase}"] = round($prob, 1) . '%';
+-            }
+-        }
+-
+-        return $caracteristicas;
+-    }
+-
+-    /**
+-     * Generar recomendaciones basadas en la clasificación
+-     */
+-    protected function generarRecomendaciones(array $resultado): array
+-    {
+-        $clase = strtolower($resultado['clase'] ?? '');
+-        $confianza = $resultado['confianza'] ?? 0;
+-
+-        $recomendaciones = [];
+-
+-        if ($confianza >= 80) {
+-            $recomendaciones[] = 'Alta confianza en la clasificación';
+-        } elseif ($confianza >= 60) {
+-            $recomendaciones[] = 'Confianza moderada - considere verificación manual';
+-        } else {
+-            $recomendaciones[] = 'Baja confianza - se recomienda nueva imagen con mejor iluminación';
+-        }
+-
+-        if (str_contains($clase, 'primera')) {
+-            $recomendaciones[] = 'Producto apto para comercialización premium';
+-            $recomendaciones[] = 'Almacenar en condiciones óptimas de humedad';
+-        } elseif (str_contains($clase, 'segunda')) {
+-            $recomendaciones[] = 'Producto apto para comercialización estándar';
+-        } elseif (str_contains($clase, 'tercera')) {
+-            $recomendaciones[] = 'Producto para uso industrial o procesamiento';
+-        }
+-
+-        if (isset($resultado['recomendacion']) && $resultado['recomendacion']) {
+-            $recomendaciones[] = $resultado['recomendacion'];
+-        }
+-
+-        return $recomendaciones;
+-    }
+-
+-    /**
+-     * Resultado demo para cuando la API no está disponible
+-     */
+-    protected function resultadoDemo(): array
+-    {
+-        return [
+-            'tipo' => 'Hoja de Coca Yungas (Demo)',
+-            'variedad' => 'Erythroxylum coca var. coca',
+-            'calidad_estimada' => 'Primera (Demo)',
+-            'caracteristicas' => [
+-                'Clasificación' => 'Modo demostración',
+-                'Estado' => 'API no disponible',
+-                'Sugerencia' => 'Verifique conexión',
+-            ],
+-            'confianza' => 0,
+-            'recomendaciones' => [
+-                'Este es un resultado de demostración',
+-                'La API de clasificación no está disponible',
+-                'Verifique que el servicio esté ejecutándose en http://localhost:5000',
++            'modelo' => [
++                'arquitectura' => $resultado['modelo']['arquitectura'] ?? null,
++                'imgsz' => $resultado['modelo']['imgsz'] ?? null,
+             ],
+-            'nota' => 'Modo demostración: Configure la API para obtener clasificaciones reales.',
+         ];
+     }
+ }
+diff --git a/app/Services/CocaClassifierService.php b/app/Services/CocaClassifierService.php
+index de6f1e1..1825e35 100644
+--- a/app/Services/CocaClassifierService.php
++++ b/app/Services/CocaClassifierService.php
+@@ -2,21 +2,71 @@
+ 
+ namespace App\Services;
+ 
++use Illuminate\Http\Client\ConnectionException;
++use Illuminate\Http\Client\PendingRequest;
++use Illuminate\Http\Client\Response;
++use Illuminate\Http\UploadedFile;
+ use Illuminate\Support\Facades\Http;
+ use Illuminate\Support\Facades\Log;
+-use Illuminate\Http\UploadedFile;
+-use Illuminate\Http\Client\ConnectionException;
+ use Exception;
+ 
+ class CocaClassifierService
+ {
+     protected string $apiUrl;
+     protected int $timeout;
++    protected string $apiKey;
++
++    /**
++     * Las consultas de estado (página principal, health) no deben bloquear la vista
++     */
++    protected const TIMEOUT_ESTADO = 5;
+ 
+     public function __construct()
+     {
+-        $this->apiUrl = rtrim(config('services.coca_api.url', 'http://localhost:5000'), '/');
+-        $this->timeout = (int) config('services.coca_api.timeout', 30);
++        $this->apiUrl = rtrim(config('services.coca_api.url') ?: 'http://127.0.0.1:5000', '/');
++        $this->timeout = (int) (config('services.coca_api.timeout') ?: 90);
++        $this->apiKey = (string) config('services.coca_api.key', '');
++    }
++
++    /**
++     * Petición base hacia la API (con la clave compartida X-API-Key si está configurada)
++     */
++    protected function cliente(?int $timeout = null): PendingRequest
++    {
++        $cliente = Http::acceptJson()->timeout($timeout ?? $this->timeout);
++
++        return $this->apiKey !== '' ? $cliente->withHeaders(['X-API-Key' => $this->apiKey]) : $cliente;
++    }
++
++    /**
++     * Analizar varias fotos de la misma hoja de coca (análisis combinado; recomendado: 5 fotos)
++     *
++     * @param  UploadedFile[]  $imagenes
++     */
++    public function analizarImagenes(array $imagenes): array
++    {
++        try {
++            $peticion = $this->cliente();
++            foreach (array_values($imagenes) as $i => $imagen) {
++                $peticion->attach(
++                    'imagenes',
++                    file_get_contents($imagen->getRealPath()),
++                    $imagen->getClientOriginalName() ?: 'captura_' . ($i + 1) . '.jpg'
++                );
++            }
++
++            return $this->procesarRespuesta($peticion->post("{$this->apiUrl}/api/analizar"));
++
++        } catch (ConnectionException $e) {
++            Log::error('CocaClassifier: Error de conexión', ['error' => $e->getMessage()]);
++            return $this->servicioInactivo();
++        } catch (Exception $e) {
++            Log::error('CocaClassifier: Error general', ['error' => $e->getMessage()]);
++            return [
++                'status' => 'error',
++                'message' => 'Error procesando las imágenes: ' . $e->getMessage(),
++            ];
++        }
+     }
+ 
+     /**
+@@ -25,7 +75,7 @@ public function __construct()
+     public function clasificarImagen(UploadedFile $imagen): array
+     {
+         try {
+-            $response = Http::timeout($this->timeout)
++            $response = $this->cliente()
+                 ->attach(
+                     'imagen',
+                     file_get_contents($imagen->getRealPath()),
+@@ -33,24 +83,11 @@ public function clasificarImagen(UploadedFile $imagen): array
+                 )
+                 ->post("{$this->apiUrl}/api/predecir");
+ 
+-            if ($response->successful()) {
+-                $data = $response->json();
+-                return $this->normalizarResultado($data);
+-            }
+-
+-            $errorData = $response->json();
+-            return [
+-                'status' => 'error',
+-                'message' => $errorData['message'] ?? 'Error en la clasificación (código ' . $response->status() . ')',
+-            ];
++            return $this->procesarRespuesta($response);
+ 
+         } catch (ConnectionException $e) {
+             Log::error('CocaClassifier: Error de conexión', ['error' => $e->getMessage()]);
+-            return [
+-                'status' => 'error',
+-                'message' => 'No se pudo conectar con el servicio de clasificación. Verifique que la API esté activa.',
+-                'servidor' => 'inactivo',
+-            ];
++            return $this->servicioInactivo();
+         } catch (Exception $e) {
+             Log::error('CocaClassifier: Error general', ['error' => $e->getMessage()]);
+             return [
+@@ -66,13 +103,17 @@ public function clasificarImagen(UploadedFile $imagen): array
+     public function obtenerClases(): array
+     {
+         try {
+-            $response = Http::timeout($this->timeout)->get("{$this->apiUrl}/api/clases");
+-            
++            $response = $this->cliente(self::TIMEOUT_ESTADO)->get("{$this->apiUrl}/api/clases");
++
+             if ($response->successful()) {
+                 return $response->json();
+             }
+ 
+-            return ['status' => 'error', 'clases' => [], 'message' => 'No se pudieron obtener las clases'];
++            return [
++                'status' => 'error',
++                'clases' => [],
++                'message' => $response->json('message') ?? 'No se pudieron obtener las clases',
++            ];
+ 
+         } catch (Exception $e) {
+             Log::warning('CocaClassifier: Error obteniendo clases', ['error' => $e->getMessage()]);
+@@ -86,8 +127,8 @@ public function obtenerClases(): array
+     public function verificarEstado(): array
+     {
+         try {
+-            $response = Http::timeout(5)->get("{$this->apiUrl}/api/status");
+-            
++            $response = $this->cliente(self::TIMEOUT_ESTADO)->get("{$this->apiUrl}/api/status");
++
+             if ($response->successful()) {
+                 $data = $response->json();
+                 $data['servidor'] = 'activo';
+@@ -97,7 +138,7 @@ public function verificarEstado(): array
+             return [
+                 'status' => 'error',
+                 'servidor' => 'inactivo',
+-                'message' => 'El servicio no respondió correctamente',
++                'message' => $response->json('message') ?? 'El servicio no respondió correctamente',
+             ];
+ 
+         } catch (Exception $e) {
+@@ -110,13 +151,12 @@ public function verificarEstado(): array
+     }
+ 
+     /**
+-     * Verificar rápidamente si la API está activa
++     * Verificar rápidamente si la API está activa (y con el modelo cargado)
+      */
+     public function estaActivo(): bool
+     {
+         try {
+-            $response = Http::timeout(5)->get("{$this->apiUrl}/api/health");
+-            return $response->successful();
++            return $this->cliente(self::TIMEOUT_ESTADO)->get("{$this->apiUrl}/api/health")->successful();
+         } catch (Exception $e) {
+             return false;
+         }
+@@ -130,6 +170,34 @@ public function getApiUrl(): string
+         return $this->apiUrl;
+     }
+ 
++    /**
++     * Resultado exitoso normalizado, o el error que explicó la API
++     */
++    protected function procesarRespuesta(Response $response): array
++    {
++        $data = $response->json();
++
++        if ($response->successful() && is_array($data)) {
++            return $this->normalizarResultado($data);
++        }
++
++        return [
++            'status' => 'error',
++            'codigo' => $data['codigo'] ?? 'http_' . $response->status(),
++            'message' => $data['message'] ?? 'Error en la clasificación (código ' . $response->status() . ')',
++            'http_status' => $response->status(),
++        ];
++    }
++
++    protected function servicioInactivo(): array
++    {
++        return [
++            'status' => 'error',
++            'message' => 'No se pudo conectar con el servicio de reconocimiento. Verifique que la API esté activa.',
++            'servidor' => 'inactivo',
++        ];
++    }
++
+     /**
+      * Normalizar el resultado de la API para la UI
+      */
+@@ -152,7 +220,7 @@ protected function normalizarResultado(array $data): array
+             $data['tipo'] = $data['tipo'] ?? $data['clase'] ?? 'No identificado';
+             $data['descripcion'] = $data['descripcion'] ?? '';
+             $data['recomendacion'] = $data['recomendacion'] ?? '';
+-            
++
+             // Si hay probabilidades, formatearlas
+             if (isset($data['probabilidades']) && is_array($data['probabilidades'])) {
+                 foreach ($data['probabilidades'] as $key => $value) {
+diff --git a/config/services.php b/config/services.php
+index f74c35f..397c10d 100644
+--- a/config/services.php
++++ b/config/services.php
+@@ -50,8 +50,10 @@
+     ],
+ 
+     'coca_api' => [
+-        'url' => env('COCA_API_URL', ''),
+-        'timeout' => env('COCA_API_TIMEOUT', 30),
++        'url' => env('COCA_API_URL', 'http://127.0.0.1:5000'),
++        'timeout' => env('COCA_API_TIMEOUT', 90),
++        // Clave compartida con la API (API_KEY en el .env de API COCA)
++        'key' => env('COCA_API_KEY', ''),
+     ],
+ 
+     'libelula' => [
+diff --git a/resources/views/pages/coca-reconocimiento/index.blade.php b/resources/views/pages/coca-reconocimiento/index.blade.php
+index 492f5b2..cf60793 100644
+--- a/resources/views/pages/coca-reconocimiento/index.blade.php
++++ b/resources/views/pages/coca-reconocimiento/index.blade.php
+@@ -595,42 +595,6 @@
+     .res-stack img:first-child { margin-left: 0; }
+     .res-stack img:hover { transform: translateY(-5px) scale(1.12); z-index: 2; position: relative; }
+ 
+-    .metrica-item {
+-        background: #fff;
+-        border: 1px solid #e8efe9;
+-        border-radius: 14px;
+-        padding: 0.85rem 1rem;
+-        transition: transform 0.2s ease, box-shadow 0.2s ease;
+-        opacity: 0;
+-        transform: translateY(10px);
+-    }
+-
+-    .metrica-item.show {
+-        opacity: 1;
+-        transform: translateY(0);
+-        transition: opacity 0.4s ease, transform 0.4s ease;
+-    }
+-
+-    .metrica-item:hover {
+-        transform: translateY(-3px);
+-        box-shadow: 0 8px 20px rgba(var(--rp), 0.10);
+-    }
+-
+-    .metrica-bar {
+-        height: 7px;
+-        border-radius: 4px;
+-        background: #eef3ef;
+-        overflow: hidden;
+-        margin-top: 6px;
+-    }
+-
+-    .metrica-bar > div {
+-        height: 100%;
+-        border-radius: 4px;
+-        width: 0;
+-        transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+-    }
+-
+     /* ==================== Overlay de análisis con GIF ==================== */
+     .analisis-overlay {
+         position: absolute;
+@@ -738,6 +702,691 @@
+         to   { opacity: 1; transform: translateY(0); }
+     }
+ 
++    /* ==================== Resultado de la red neuronal ==================== */
++    .badge-preliminar.ia-inactiva {
++        background: rgba(213, 43, 30, 0.08);
++        color: #b42318;
++        border-color: rgba(213, 43, 30, 0.35);
++    }
++
++    .estado-badge { letter-spacing: 0.02em; }
++    .estado-confirmado     { background: #fff; color: #1a7f37; }
++    .estado-probable       { background: #fff4d6; color: #8a5a00; }
++    .estado-no_concluyente { background: #eef1f4; color: #475569; }
++    .estado-rechazado      { background: #fde8e8; color: #b42318; }
++
++    /* Botón que abre el análisis completo (mismo verde del modal) */
++    .btn-ver-analisis {
++        display: flex;
++        align-items: center;
++        justify-content: center;
++        gap: 8px;
++        width: 100%;
++        border: 0;
++        border-radius: 14px;
++        padding: 0.85rem 1.1rem;
++        background: #0b8a5f;
++        color: #fff;
++        font-weight: 700;
++        font-size: 0.9rem;
++        box-shadow: 0 10px 24px rgba(11, 138, 95, 0.28);
++        transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
++    }
++
++    .btn-ver-analisis:hover { background: #0a7a54; transform: translateY(-2px); box-shadow: 0 14px 30px rgba(11, 138, 95, 0.36); }
++    .btn-ver-analisis:focus-visible { outline: 3px solid rgba(18, 184, 134, 0.45); outline-offset: 2px; }
++
++    /* ==================== Modal «Análisis completo» ====================
++       A la izquierda, el resultado, las secciones y la probabilidad por tipo; a la
++       derecha, las fotos agrupadas en «Coinciden / No coinciden», las métricas y el
++       informe. Verde = coincide, rojo = no coincide, ámbar = aviso. Fondos, bordes y
++       textos salen del tema, así se ve bien en modo claro y en modo oscuro. */
++    .coca-modal {
++        --cm-bg: var(--custom-white, #fff);
++        --cm-lateral: var(--default-background, #f7f8fa);
++        --cm-borde: var(--default-border, #e6ebf1);
++        --cm-texto: var(--default-text-color, #191919);
++        --cm-tenue: var(--text-muted, #64748b);
++        --cm-pista: color-mix(in srgb, var(--cm-texto) 9%, transparent);
++        --cm-hover: color-mix(in srgb, var(--cm-texto) 5%, transparent);
++        --cm-ok: #12b886;
++        --cm-ok-fondo: #0b8a5f;
++        --cm-ok-texto: #087f5b;
++        --cm-mal: #ef4444;
++        --cm-mal-fondo: #d92d20;
++        --cm-mal-texto: #c81e1e;
++        --cm-alerta: #f59e0b;
++        --cm-alerta-texto: #a16207;
++        --cm-neutro: #94a3b8;
++        --cm-neutro-texto: #475569;
++    }
++
++    [data-theme-mode="dark"] .coca-modal {
++        --cm-ok-texto: #34d399;
++        --cm-mal-texto: #f87171;
++        --cm-alerta-texto: #fbbf24;
++        --cm-neutro-texto: #cbd5e1;
++    }
++
++    .coca-modal .modal-content.cm-app {
++        border: 0;
++        background: var(--cm-bg);
++        color: var(--cm-texto);
++    }
++
++    .cm-min0 { min-width: 0; }
++
++    /* ---- Barra lateral ---- */
++    .cm-marca { display: flex; align-items: flex-start; gap: 12px; }
++
++    .cm-marca-ico {
++        width: 44px;
++        height: 44px;
++        border-radius: 14px;
++        flex-shrink: 0;
++        display: inline-flex;
++        align-items: center;
++        justify-content: center;
++        font-size: 1.35rem;
++        background: rgba(18, 184, 134, 0.14);
++        color: var(--cm-ok-texto);
++    }
++
++    .cm-marca-ico.t-alerta { background: rgba(245, 158, 11, 0.16); color: var(--cm-alerta-texto); }
++    .cm-marca-ico.t-neutro { background: rgba(148, 163, 184, 0.2); color: var(--cm-neutro-texto); }
++    .cm-marca-ico.t-mal    { background: rgba(239, 68, 68, 0.13); color: var(--cm-mal-texto); }
++
++    .cm-titulo {
++        font-size: 1.3rem;
++        font-weight: 700;
++        line-height: 1.2;
++        margin: 2px 0 0;
++        color: var(--cm-texto);
++        overflow-wrap: anywhere;
++    }
++
++    .cm-subtitulo {
++        display: flex;
++        flex-wrap: wrap;
++        align-items: center;
++        gap: 6px 8px;
++        margin-top: 7px;
++        font-size: 0.78rem;
++        color: var(--cm-tenue);
++    }
++
++    .cm-estado {
++        font-size: 0.7rem;
++        font-weight: 700;
++        letter-spacing: 0.02em;
++        padding: 3px 10px;
++        border-radius: 99px;
++    }
++
++    .cm-estado.is-confirmado     { background: rgba(18, 184, 134, 0.15); color: var(--cm-ok-texto); }
++    .cm-estado.is-probable       { background: rgba(245, 158, 11, 0.16); color: var(--cm-alerta-texto); }
++    .cm-estado.is-no_concluyente { background: rgba(148, 163, 184, 0.22); color: var(--cm-neutro-texto); }
++    .cm-estado.is-rechazado      { background: rgba(239, 68, 68, 0.14); color: var(--cm-mal-texto); }
++
++    .cm-nav { display: flex; flex-direction: column; gap: 4px; }
++
++    .cm-nav-item {
++        display: flex;
++        align-items: center;
++        gap: 11px;
++        width: 100%;
++        border: 0;
++        border-radius: 12px;
++        padding: 10px 12px;
++        background: transparent;
++        color: var(--cm-texto);
++        font-size: 0.9rem;
++        font-weight: 500;
++        text-align: left;
++        transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
++    }
++
++    .cm-nav-item i { font-size: 1.15rem; opacity: 0.7; }
++    .cm-nav-item:hover { background: var(--cm-hover); }
++    .cm-nav-item:focus-visible { outline: 3px solid rgba(18, 184, 134, 0.45); outline-offset: 1px; }
++    .cm-nav-item.active { background: var(--cm-ok-fondo); color: #fff; font-weight: 600; box-shadow: 0 8px 18px rgba(11, 138, 95, 0.28); }
++    .cm-nav-item.active i { opacity: 1; }
++
++    .cm-nav-num {
++        margin-left: auto;
++        font-size: 0.72rem;
++        font-weight: 700;
++        padding: 1px 8px;
++        border-radius: 99px;
++        background: var(--cm-pista);
++    }
++
++    .cm-nav-item.active .cm-nav-num { background: rgba(255, 255, 255, 0.22); }
++
++    .cm-side-label {
++        font-size: 0.68rem;
++        font-weight: 700;
++        letter-spacing: 0.06em;
++        text-transform: uppercase;
++        color: var(--cm-tenue);
++        margin: 0 10px 6px;
++    }
++
++    .cm-clases { display: flex; flex-direction: column; gap: 2px; }
++    .cm-fila { padding: 8px 10px; border-radius: 12px; }
++    .cm-fila.es-general { background: var(--cm-hover); padding: 11px 12px; }
++
++    .cm-fila-top {
++        display: flex;
++        justify-content: space-between;
++        align-items: baseline;
++        gap: 8px;
++        margin-bottom: 6px;
++        font-size: 0.82rem;
++    }
++
++    .cm-fila-top > span { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++    .cm-fila-top > b { flex-shrink: 0; font-size: 0.78rem; font-weight: 600; color: var(--cm-tenue); }
++    .cm-fila.es-ganadora .cm-fila-top > b { color: var(--cm-texto); }
++
++    .cm-barra {
++        display: flex;
++        height: 5px;
++        border-radius: 99px;
++        background: var(--cm-pista);
++        overflow: hidden;
++    }
++
++    .cm-barra > span { display: block; height: 100%; width: 0; transition: width 1s cubic-bezier(0.4, 0, 0.2, 1); }
++    .cm-barra > .t-ok     { background: var(--cm-ok); }
++    .cm-barra > .t-mal    { background: var(--cm-mal); }
++    .cm-barra > .t-alerta { background: var(--cm-alerta); }
++    .cm-barra > .t-neutro { background: var(--cm-neutro); }
++    .cm-barra > .t-suave  { background: color-mix(in srgb, var(--cm-ok) 45%, transparent); }
++
++    .cm-ver-mas {
++        align-self: flex-start;
++        border: 0;
++        background: transparent;
++        color: var(--cm-ok-texto);
++        font-size: 0.78rem;
++        font-weight: 600;
++        padding: 6px 10px;
++        border-radius: 8px;
++    }
++
++    .cm-ver-mas:hover { background: var(--cm-hover); }
++
++    .cm-resumen { margin: 0; font-size: 0.84rem; line-height: 1.55; color: var(--cm-texto); }
++    .cm-resumen .ok     { color: var(--cm-ok-texto); }
++    .cm-resumen .mal    { color: var(--cm-mal-texto); }
++    .cm-resumen .alerta { color: var(--cm-alerta-texto); }
++
++    /* ---- Contenido ---- */
++    .cm-main { position: relative; min-width: 0; }
++
++    .cm-cabecera {
++        display: flex;
++        align-items: center;
++        justify-content: space-between;
++        gap: 12px;
++        flex-wrap: wrap;
++    }
++
++    .cm-seccion-titulo { font-size: 1.2rem; font-weight: 700; margin: 0; color: var(--cm-texto); }
++    .cm-seccion-sub { font-size: 0.78rem; color: var(--cm-tenue); margin-top: 2px; }
++    .cm-acciones { display: flex; align-items: center; gap: 8px; margin-left: auto; }
++
++    .cm-vista { display: inline-flex; padding: 3px; border-radius: 12px; background: var(--cm-pista); }
++
++    .cm-vista button {
++        border: 0;
++        background: transparent;
++        color: var(--cm-tenue);
++        font-size: 0.8rem;
++        font-weight: 600;
++        padding: 7px 13px;
++        border-radius: 9px;
++        display: inline-flex;
++        align-items: center;
++        gap: 6px;
++        transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
++    }
++
++    .cm-vista button.active { background: var(--cm-bg); color: var(--cm-texto); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.14); }
++
++    .cm-cerrar {
++        width: 38px;
++        height: 38px;
++        flex-shrink: 0;
++        border: 0;
++        border-radius: 50%;
++        background: var(--cm-pista);
++        color: var(--cm-texto);
++        display: inline-flex;
++        align-items: center;
++        justify-content: center;
++        font-size: 1.1rem;
++        transition: background 0.2s ease;
++    }
++
++    .cm-cerrar:hover { background: color-mix(in srgb, var(--cm-texto) 15%, transparent); }
++
++    /* Grupos de fotos y mosaicos */
++    .cm-grupo + .cm-grupo { margin-top: 24px; }
++
++    .cm-grupo-titulo {
++        display: flex;
++        align-items: baseline;
++        gap: 7px;
++        margin: 0 0 12px;
++        font-size: 0.98rem;
++        font-weight: 700;
++        color: var(--cm-texto);
++    }
++
++    .cm-grupo-titulo small { font-size: 0.86rem; font-weight: 500; color: var(--cm-tenue); }
++
++    .cm-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
++
++    .cm-tile {
++        position: relative;
++        display: block;
++        width: 100%;
++        aspect-ratio: 1 / 1;
++        padding: 0;
++        border: 0;
++        border-radius: 16px;
++        overflow: hidden;
++        background: #0f1a14;
++        cursor: zoom-in;
++        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
++        opacity: 0;
++        transform: translateY(10px) scale(0.98);
++        animation: cmEntrar 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
++        animation-delay: calc(var(--i, 0) * 70ms);
++        transition: box-shadow 0.25s ease;
++    }
++
++    .cm-tile:hover { box-shadow: 0 14px 32px rgba(15, 23, 42, 0.22); }
++    .cm-tile:focus-visible { outline: 3px solid var(--cm-ok); outline-offset: 2px; }
++
++    @keyframes cmEntrar { to { opacity: 1; transform: none; } }
++
++    .cm-tile img {
++        position: absolute;
++        inset: 0;
++        width: 100%;
++        height: 100%;
++        object-fit: cover;
++        transition: opacity 0.35s ease, transform 0.5s ease;
++    }
++
++    .cm-tile:hover img { transform: scale(1.05); }
++
++    /* Degradado inferior para que la etiqueta se lea sobre cualquier foto */
++    .cm-tile::after {
++        content: '';
++        position: absolute;
++        inset: auto 0 0 0;
++        height: 45%;
++        background: linear-gradient(to top, rgba(0, 0, 0, 0.45), transparent);
++        pointer-events: none;
++    }
++
++    .cm-img-mapa { opacity: 0; }
++    .cm-grupos.ver-mapa .cm-img-mapa,
++    .cm-visor-img.ver-mapa .cm-img-mapa { opacity: 1; }
++    .cm-grupos.ver-mapa .cm-tile .cm-img-foto { opacity: 0; }
++
++    .cm-sin-foto {
++        position: absolute;
++        inset: 0;
++        display: flex;
++        align-items: center;
++        justify-content: center;
++        color: rgba(255, 255, 255, 0.45);
++        font-size: 2rem;
++    }
++
++    .cm-etiqueta {
++        position: absolute;
++        left: 10px;
++        bottom: 10px;
++        z-index: 2;
++        max-width: calc(100% - 20px);
++        display: inline-flex;
++        align-items: center;
++        gap: 5px;
++        padding: 5px 10px;
++        border-radius: 9px;
++        background: var(--cm-ok-fondo);
++        color: #fff;
++        font-size: 0.76rem;
++        font-weight: 600;
++        white-space: nowrap;
++        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
++    }
++
++    .cm-etiqueta > span { overflow: hidden; text-overflow: ellipsis; }
++    .cm-etiqueta > i { flex-shrink: 0; }
++    .cm-etiqueta.es-mal  { background: var(--cm-mal-fondo); }
++    .cm-etiqueta.es-duda { background: #fbbf24; color: #3b2600; }
++    .cm-etiqueta.en-linea { position: static; font-size: 0.86rem; padding: 6px 12px; box-shadow: none; }
++
++    .cm-chip {
++        position: absolute;
++        top: 9px;
++        z-index: 2;
++        display: inline-flex;
++        align-items: center;
++        gap: 4px;
++        padding: 3px 8px;
++        border-radius: 99px;
++        background: rgba(15, 23, 42, 0.55);
++        color: #fff;
++        font-size: 0.7rem;
++        font-weight: 700;
++        backdrop-filter: blur(4px);
++        -webkit-backdrop-filter: blur(4px);
++    }
++
++    .cm-chip.izq { left: 9px; }
++    .cm-chip.der { right: 9px; }
++    .cm-chip.ajena { background: rgba(245, 158, 11, 0.94); color: #3b2600; }
++
++    .cm-leyenda { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 18px 0 0; font-size: 0.78rem; color: var(--cm-tenue); }
++
++    .cm-escala {
++        width: 110px;
++        height: 8px;
++        border-radius: 99px;
++        background: linear-gradient(90deg, #00008f, #0050ff, #00e5ff, #ffee00, #ff3c00, #8f0000);
++    }
++
++    .cm-vacio { color: var(--cm-tenue); font-size: 0.86rem; margin: 0; }
++
++    /* Métricas */
++    .cm-metricas { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
++
++    .cm-metrica {
++        border: 1px solid var(--cm-borde);
++        border-radius: 16px;
++        padding: 16px 18px;
++        background: var(--cm-bg);
++        opacity: 0;
++        animation: cmEntrar 0.45s ease forwards;
++        animation-delay: calc(var(--i, 0) * 60ms);
++    }
++
++    .cm-metrica-top { display: flex; align-items: center; gap: 12px; }
++
++    .cm-metrica-ico {
++        width: 40px;
++        height: 40px;
++        border-radius: 12px;
++        flex-shrink: 0;
++        display: inline-flex;
++        align-items: center;
++        justify-content: center;
++        font-size: 1.2rem;
++    }
++
++    .cm-metrica-ico.t-ok     { background: rgba(18, 184, 134, 0.13); color: var(--cm-ok-texto); }
++    .cm-metrica-ico.t-alerta { background: rgba(245, 158, 11, 0.15); color: var(--cm-alerta-texto); }
++    .cm-metrica-ico.t-mal    { background: rgba(239, 68, 68, 0.12); color: var(--cm-mal-texto); }
++
++    .cm-metrica-nombre { font-size: 0.84rem; font-weight: 600; }
++    .cm-metrica-nivel { font-size: 0.72rem; font-weight: 700; }
++    .cm-metrica-valor { margin-left: auto; font-size: 1.55rem; font-weight: 700; line-height: 1; }
++    .cm-metrica .cm-barra { height: 7px; margin: 14px 0 8px; }
++    .cm-metrica p { margin: 0; font-size: 0.76rem; color: var(--cm-tenue); }
++
++    .cm-tono-ok     { color: var(--cm-ok-texto); }
++    .cm-tono-alerta { color: var(--cm-alerta-texto); }
++    .cm-tono-mal    { color: var(--cm-mal-texto); }
++
++    /* Informe */
++    .cm-veredicto {
++        display: flex;
++        align-items: flex-start;
++        gap: 12px;
++        padding: 14px 16px;
++        border-radius: 14px;
++        margin-bottom: 14px;
++        font-size: 0.88rem;
++        font-weight: 500;
++    }
++
++    .cm-veredicto i { font-size: 1.3rem; flex-shrink: 0; margin-top: 1px; }
++    .cm-veredicto.is-confirmado     { background: rgba(18, 184, 134, 0.11); color: var(--cm-ok-texto); }
++    .cm-veredicto.is-probable       { background: rgba(245, 158, 11, 0.13); color: var(--cm-alerta-texto); }
++    .cm-veredicto.is-no_concluyente { background: rgba(148, 163, 184, 0.16); color: var(--cm-neutro-texto); }
++    .cm-veredicto.is-rechazado      { background: rgba(239, 68, 68, 0.1); color: var(--cm-mal-texto); }
++
++    .cm-seccion {
++        border: 1px solid var(--cm-borde);
++        border-radius: 16px;
++        padding: 16px 18px;
++        margin-bottom: 14px;
++    }
++
++    .cm-seccion.ia {
++        border-color: rgba(99, 102, 241, 0.28);
++        background: linear-gradient(135deg, rgba(99, 102, 241, 0.06), rgba(168, 85, 247, 0.06));
++    }
++
++    .cm-seccion.alerta { border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.06); }
++
++    .cm-seccion h6 {
++        display: flex;
++        align-items: center;
++        gap: 7px;
++        margin: 0 0 10px;
++        font-size: 0.78rem;
++        font-weight: 700;
++        letter-spacing: 0.04em;
++        text-transform: uppercase;
++        color: var(--cm-tenue);
++    }
++
++    .cm-seccion.ia h6 i { color: #6366f1; }
++    .cm-seccion p { margin: 0; font-size: 0.88rem; line-height: 1.65; }
++
++    .cm-lista { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; font-size: 0.85rem; }
++    .cm-lista li { display: flex; align-items: flex-start; gap: 9px; }
++    .cm-lista li i { flex-shrink: 0; margin-top: 2px; }
++    .cm-lista.ok li i { color: var(--cm-ok); }
++    .cm-seccion.alerta .cm-lista li i, .cm-visor-avisos li i { color: var(--cm-alerta); }
++
++    .cm-tecnico { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 0; }
++    .cm-tecnico > div { background: var(--cm-hover); border-radius: 12px; padding: 10px 12px; }
++
++    .cm-tecnico dt {
++        font-size: 0.68rem;
++        font-weight: 600;
++        letter-spacing: 0.03em;
++        text-transform: uppercase;
++        color: var(--cm-tenue);
++    }
++
++    .cm-tecnico dd { margin: 3px 0 0; font-size: 0.9rem; font-weight: 700; overflow-wrap: anywhere; }
++
++    .cm-pie { display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--cm-borde); background: var(--cm-bg); }
++    .cm-btn { border-radius: 12px; padding: 0.6rem 1.15rem; font-weight: 600; }
++    .cm-btn-ok { background: var(--cm-ok-fondo); color: #fff; border: 0; }
++    .cm-btn-ok:hover, .cm-btn-ok:focus-visible { background: #0a7a54; color: #fff; }
++
++    /* Detalle de una foto */
++    .cm-visor {
++        display: flex;
++        flex-direction: column;
++        background: var(--cm-bg);
++        z-index: 6;
++        animation: cmVisorEntrar 0.25s ease;
++    }
++
++    @keyframes cmVisorEntrar {
++        from { opacity: 0; transform: scale(0.985); }
++        to   { opacity: 1; transform: none; }
++    }
++
++    .cm-visor-cab { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--cm-borde); }
++    .cm-visor-cab h4 { flex: 1; margin: 0; font-size: 1.05rem; font-weight: 700; }
++
++    .cm-visor-nav {
++        width: 38px;
++        height: 38px;
++        border-radius: 50%;
++        border: 1px solid var(--cm-borde);
++        background: var(--cm-bg);
++        color: var(--cm-texto);
++        display: inline-flex;
++        align-items: center;
++        justify-content: center;
++        font-size: 1.1rem;
++    }
++
++    .cm-visor-nav:disabled { opacity: 0.35; }
++    .cm-visor-cuerpo { flex: 1; min-height: 0; overflow-y: auto; display: grid; gap: 24px; align-content: start; }
++
++    .cm-visor-img {
++        position: relative;
++        aspect-ratio: 1 / 1;
++        border-radius: 18px;
++        overflow: hidden;
++        background: #0f1a14;
++    }
++
++    .cm-visor-img img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.35s ease; }
++    .cm-visor-img.ver-mapa #cmVisorFoto { opacity: 0; }
++
++    .cm-vista-flotante {
++        position: absolute;
++        left: 50%;
++        bottom: 12px;
++        transform: translateX(-50%);
++        z-index: 2;
++        background: rgba(15, 23, 42, 0.55);
++        backdrop-filter: blur(6px);
++        -webkit-backdrop-filter: blur(6px);
++    }
++
++    .cm-vista-flotante button { color: rgba(255, 255, 255, 0.85); white-space: nowrap; }
++    .cm-vista-flotante button.active { background: #fff; color: #0f172a; }
++
++    .cm-visor-texto { margin: 12px 0 18px; font-size: 0.88rem; line-height: 1.55; }
++
++    /* Escritorio: dos columnas con alto fijo; cada lado se desplaza por su cuenta */
++    @media (min-width: 992px) {
++        .coca-modal .modal-dialog { --bs-modal-width: min(1120px, calc(100vw - 2.5rem)); }
++
++        .coca-modal .modal-content.cm-app {
++            flex-direction: row;
++            height: min(760px, calc(100vh - 3.5rem));
++            border-radius: 24px;
++            overflow: hidden;
++            box-shadow: 0 30px 90px rgba(15, 23, 42, 0.3);
++        }
++
++        .cm-side {
++            width: 290px;
++            flex-shrink: 0;
++            display: flex;
++            flex-direction: column;
++            gap: 16px;
++            padding: 26px 18px 22px;
++            background: var(--cm-lateral);
++            border-right: 1px solid var(--cm-borde);
++            overflow-y: auto;
++        }
++
++        .cm-marca { padding: 0 6px; }
++        .cm-resumen { margin-top: auto; padding: 4px 6px 0; }
++
++        .cm-main { flex: 1; display: flex; flex-direction: column; }
++        .cm-cabecera { padding: 24px 28px 14px; }
++        .cm-cuerpo { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px 28px 26px; }
++        .cm-pie { padding: 14px 28px; }
++
++        .cm-visor { position: absolute; inset: 0; }
++        .cm-visor-cab { padding: 18px 24px; }
++        .cm-visor-cuerpo { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); padding: 22px 24px; }
++    }
++
++    @media (min-width: 992px) and (max-width: 1199.98px) {
++        .cm-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
++        .cm-tecnico { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++    }
++
++    /* Celular y tablet: pantalla completa con un solo desplazamiento,
++       pestañas fijas arriba y botones fijos abajo */
++    @media (max-width: 991.98px) {
++        .coca-modal .modal-content.cm-app {
++            display: flex;
++            flex-direction: column;
++            overflow-y: auto;
++            overscroll-behavior: contain;
++        }
++
++        .cm-side { display: contents; }
++        .cm-app > * , .cm-side > * { flex-shrink: 0; }
++
++        .cm-marca { order: 1; padding: 16px 16px 10px; align-items: center; }
++        .cm-titulo { font-size: 1.15rem; }
++        .cm-fila.es-general { order: 2; margin: 0 16px; }
++        .cm-resumen { order: 3; padding: 10px 16px 4px; font-size: 0.82rem; }
++        .cm-clases-box { display: none; }
++
++        .cm-nav {
++            order: 4;
++            position: sticky;
++            top: 0;
++            z-index: 4;
++            flex-direction: row;
++            gap: 6px;
++            margin-top: 10px;
++            padding: 8px 16px;
++            background: var(--cm-bg);
++            border-bottom: 1px solid var(--cm-borde);
++        }
++
++        .cm-nav-item { flex: 1; justify-content: center; gap: 7px; padding: 9px 6px; font-size: 0.84rem; }
++        .cm-nav-num { margin-left: 0; }
++
++        .cm-main { order: 5; flex: 1 0 auto; display: flex; flex-direction: column; }
++        .cm-cabecera { padding: 16px 16px 12px; }
++        .cm-cuerpo { flex: 1 0 auto; padding: 0 16px 20px; }
++        .cm-pie { position: sticky; bottom: 0; z-index: 4; padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
++        .cm-pie .cm-btn { flex: 1; }
++
++        .cm-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
++        .cm-metricas { grid-template-columns: 1fr; }
++        .cm-tecnico { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++
++        .cm-visor { position: fixed; inset: 0; z-index: 1065; }
++        .cm-visor-cab { padding: 12px 16px; }
++        .cm-visor-cuerpo { grid-template-columns: 1fr; gap: 16px; padding: 16px 16px calc(20px + env(safe-area-inset-bottom)); }
++        .cm-visor-img { max-width: 520px; width: 100%; margin: 0 auto; }
++    }
++
++    @media (max-width: 575.98px) {
++        .cm-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
++        .cm-vista button span { display: none; }
++        .cm-vista button { padding: 7px 11px; }
++    }
++
++    @media (prefers-reduced-motion: reduce) {
++        .cm-tile, .cm-metrica { animation: none; opacity: 1; transform: none; }
++        .cm-barra > span { transition: none; }
++        .cm-visor { animation: none; }
++    }
++
++    /* Con el modal abierto, el botón flotante del asistente no tapa el contenido */
++    body.coca-modal-abierto .adep-bot-launcher,
++    body.coca-modal-abierto .adep-bot-nudge,
++    body.coca-modal-abierto .adep-bot-panel { display: none !important; }
++
+     @media (max-width: 575.98px) {
+         .cam-stage { aspect-ratio: 3 / 4; border-radius: 14px; }
+         .shutter-btn { width: 72px; height: 72px; }
+@@ -760,8 +1409,12 @@
+         <h1 class="page-title fw-semibold fs-20 mb-0">Reconocimiento de Hoja de Coca</h1>
+         <p class="text-muted mb-0">Captura 5 fotos con tu cámara y obtén un análisis al instante</p>
+     </div>
+-    <span class="badge-preliminar">
+-        <i class="ti ti-sparkles"></i>Análisis en tu dispositivo · IA próximamente
++    <span class="badge-preliminar {{ $apiActiva ? '' : 'ia-inactiva' }}">
++        @if ($apiActiva)
++            <i class="ti ti-sparkles"></i>Red neuronal YOLO26 · IA activa
++        @else
++            <i class="ti ti-alert-triangle"></i>Servicio de IA no disponible
++        @endif
+     </span>
+ </div>
+ 
+@@ -883,7 +1536,7 @@
+                 <!-- Placeholder -->
+                 <div id="resultadoPlaceholder" class="text-center py-5 h-100 d-flex flex-column justify-content-center align-items-center">
+                     <div class="avatar avatar-xxl bg-success-transparent rounded-circle mb-3">
+-                        <i class="ti ti-leaf-2 fs-32 text-success opacity-75"></i>
++                        <i class="ti ti-leaf fs-32 text-success opacity-75"></i>
+                     </div>
+                     <h5 class="text-muted fw-semibold">Esperando capturas</h5>
+                     <p class="text-muted mb-0 mx-auto" style="max-width: 330px;">Enciende la cámara y toma 5 fotos de la hoja de coca. Aquí verás el análisis combinado de todas las capturas.</p>
+@@ -913,21 +1566,21 @@
+                                 </div>
+                                 <div class="d-flex align-items-center gap-2">
+                                     <div class="res-stack" id="resStack"></div>
+-                                    <span class="fs-11 opacity-75">5 capturas analizadas</span>
++                                    <span class="fs-11 opacity-75" id="resCapturas">5 capturas analizadas</span>
+                                 </div>
+                             </div>
+                         </div>
+                     </div>
+ 
+-                    <h6 class="fw-bold fs-12 text-uppercase text-muted mb-3">
+-                        <i class="ti ti-chart-dots me-1"></i>Métricas promedio de las 5 fotos
+-                    </h6>
+-                    <div class="d-flex flex-column gap-2 mb-4" id="metricas"></div>
+-
+-                    <div class="alert alert-warning border-0 shadow-sm d-flex align-items-start gap-2 mb-0 fs-12">
++                    <div class="alert border-0 shadow-sm d-flex align-items-start gap-2 mb-3 fs-12" id="resMensaje">
+                         <i class="ti ti-info-circle fs-16 mt-1 flex-shrink-0"></i>
+-                        <span>Resultado <strong>preliminar</strong> generado en tu dispositivo combinando las 5 capturas. El modelo de inteligencia artificial se conectará próximamente para una clasificación oficial.</span>
++                        <span></span>
+                     </div>
++
++                    <!-- Todo el detalle (fotos, métricas, mapas de calor e informe) va en el modal -->
++                    <button type="button" class="btn-ver-analisis" id="verAnalisisBtn">
++                        <i class="ti ti-layout-grid fs-18"></i>Ver análisis completo<i class="ti ti-arrow-right"></i>
++                    </button>
+                 </div>
+             </div>
+ 
+@@ -938,13 +1591,13 @@
+                     <div class="analisis-titulo mb-1">Analizando hoja de coca</div>
+                     <div class="analisis-foto-progreso" id="analisisFotoProgreso">Procesando captura 1 de 5…</div>
+                     <div class="analisis-step" data-step="1">
+-                        <span class="st-ico"><i class="ti ti-photo-scan"></i></span>Procesando las 5 capturas
++                        <span class="st-ico"><i class="ti ti-scan"></i></span>Preparando las capturas
+                     </div>
+                     <div class="analisis-step" data-step="2">
+-                        <span class="st-ico"><i class="ti ti-palette"></i></span>Analizando color y tonalidad
++                        <span class="st-ico"><i class="ti ti-cloud-upload"></i></span>Enviando al servidor de IA
+                     </div>
+                     <div class="analisis-step" data-step="3">
+-                        <span class="st-ico"><i class="ti ti-texture"></i></span>Evaluando textura y nitidez
++                        <span class="st-ico"><i class="ti ti-brain"></i></span>Red neuronal analizando la hoja
+                     </div>
+                     <div class="analisis-step" data-step="4">
+                         <span class="st-ico"><i class="ti ti-arrows-diff"></i></span>Comparando consistencia entre fotos
+@@ -992,11 +1645,144 @@
+ </div>
+ @endsection
+ 
++@section('modals')
++<!-- ==================== Modal: análisis completo de la red neuronal ==================== -->
++<div class="modal fade coca-modal" id="cocaResultadoModal" tabindex="-1" aria-labelledby="cmTitulo" aria-hidden="true">
++    <div class="modal-dialog modal-dialog-centered modal-fullscreen-lg-down">
++        <div class="modal-content cm-app">
++            <!-- Lateral: resultado, secciones y probabilidad por tipo -->
++            <aside class="cm-side">
++                <div class="cm-marca">
++                    <span class="cm-marca-ico" id="cmMarcaIco"><i class="ti ti-leaf"></i></span>
++                    <div class="cm-min0 flex-grow-1">
++                        <h2 class="cm-titulo" id="cmTitulo">—</h2>
++                        <div class="cm-subtitulo">
++                            <span class="cm-estado" id="cmEstado"></span>
++                            <span id="cmConfianza"></span>
++                        </div>
++                    </div>
++                    <button type="button" class="cm-cerrar d-lg-none" data-bs-dismiss="modal" aria-label="Cerrar"><i class="ti ti-x"></i></button>
++                </div>
++
++                <nav class="cm-nav" role="tablist" aria-label="Secciones del análisis">
++                    <button type="button" class="cm-nav-item active" role="tab" id="cmTabFotos" aria-controls="cmPanelFotos" aria-selected="true" data-cm-tab="fotos">
++                        <i class="ti ti-photo"></i><span>Fotos</span><b class="cm-nav-num" id="cmNavFotos">0</b>
++                    </button>
++                    <button type="button" class="cm-nav-item" role="tab" id="cmTabMetricas" aria-controls="cmPanelMetricas" aria-selected="false" tabindex="-1" data-cm-tab="metricas">
++                        <i class="ti ti-chart-bar"></i><span>Métricas</span>
++                    </button>
++                    <button type="button" class="cm-nav-item" role="tab" id="cmTabInforme" aria-controls="cmPanelInforme" aria-selected="false" tabindex="-1" data-cm-tab="informe">
++                        <i class="ti ti-brain"></i><span>Informe</span>
++                    </button>
++                </nav>
++
++                <div class="cm-fila es-general" id="cmGeneral"></div>
++
++                <div class="cm-clases-box">
++                    <div class="cm-side-label">Probabilidad por tipo</div>
++                    <div class="cm-clases" id="cmClases"></div>
++                    <button type="button" class="cm-ver-mas d-none" id="cmVerMas"></button>
++                </div>
++
++                <p class="cm-resumen" id="cmResumen"></p>
++            </aside>
++
++            <!-- Contenido de la sección elegida -->
++            <section class="cm-main">
++                <header class="cm-cabecera">
++                    <div class="cm-min0">
++                        <h3 class="cm-seccion-titulo" id="cmSeccion">Fotos analizadas</h3>
++                        <div class="cm-seccion-sub" id="cmHora"></div>
++                    </div>
++                    <div class="cm-acciones">
++                        <div class="cm-vista" id="cmVistaControl" role="group" aria-label="Ver las fotos o el mapa de calor">
++                            <button type="button" class="active" data-cm-vista="foto" aria-pressed="true"><i class="ti ti-photo"></i><span>Fotos</span></button>
++                            <button type="button" data-cm-vista="mapa" aria-pressed="false"><i class="ti ti-flame"></i><span>Mapa de calor</span></button>
++                        </div>
++                        <button type="button" class="cm-cerrar d-none d-lg-inline-flex" data-bs-dismiss="modal" aria-label="Cerrar"><i class="ti ti-x"></i></button>
++                    </div>
++                </header>
++
++                <div class="cm-cuerpo" id="cmCuerpo">
++                    <div class="cm-panel" data-panel="fotos" id="cmPanelFotos" role="tabpanel" aria-labelledby="cmTabFotos">
++                        <div class="cm-grupos" id="cmGrupos"></div>
++                        <p class="cm-leyenda d-none" id="cmLeyenda">
++                            <span class="cm-escala"></span>Azul: poca influencia · Rojo: zonas que más pesaron en la decisión de la red
++                        </p>
++                    </div>
++
++                    <div class="cm-panel d-none" data-panel="metricas" id="cmPanelMetricas" role="tabpanel" aria-labelledby="cmTabMetricas">
++                        <div class="cm-metricas" id="cmMetricas"></div>
++                        <div class="cm-seccion mt-3 mb-0 d-lg-none">
++                            <h6><i class="ti ti-chart-bar"></i>Probabilidad por tipo de hoja</h6>
++                            <div class="cm-clases" id="cmClasesMovil"></div>
++                        </div>
++                    </div>
++
++                    <div class="cm-panel d-none" data-panel="informe" id="cmPanelInforme" role="tabpanel" aria-labelledby="cmTabInforme">
++                        <div class="cm-veredicto" id="cmVeredicto"><i class="ti ti-info-circle"></i><span></span></div>
++                        <div class="cm-seccion ia" id="cmExplicacionBox">
++                            <h6><i class="ti ti-brain"></i>Explicación de la red neuronal</h6>
++                            <p id="cmExplicacion"></p>
++                        </div>
++                        <div class="cm-seccion" id="cmRecomendacionesBox">
++                            <h6><i class="ti ti-bulb"></i>Recomendaciones</h6>
++                            <ul class="cm-lista ok" id="cmRecomendaciones"></ul>
++                        </div>
++                        <div class="cm-seccion alerta" id="cmAdvertenciasBox">
++                            <h6><i class="ti ti-alert-triangle"></i>Advertencias</h6>
++                            <ul class="cm-lista" id="cmAdvertencias"></ul>
++                        </div>
++                        <dl class="cm-tecnico" id="cmTecnico"></dl>
++                    </div>
++                </div>
++
++                <footer class="cm-pie">
++                    <button type="button" class="btn btn-light cm-btn" data-bs-dismiss="modal">Cerrar</button>
++                    <button type="button" class="btn cm-btn cm-btn-ok" id="cmNuevaCaptura"><i class="ti ti-camera-plus me-1"></i>Nueva captura</button>
++                </footer>
++
++                <!-- Detalle de una foto -->
++                <div class="cm-visor d-none" id="cmVisor" role="dialog" aria-modal="true" aria-labelledby="cmVisorTitulo">
++                    <div class="cm-visor-cab">
++                        <button type="button" class="cm-cerrar" id="cmVisorVolver" aria-label="Volver a todas las fotos"><i class="ti ti-arrow-left"></i></button>
++                        <h4 id="cmVisorTitulo"></h4>
++                        <button type="button" class="cm-visor-nav" id="cmVisorAnterior" aria-label="Foto anterior"><i class="ti ti-chevron-left"></i></button>
++                        <button type="button" class="cm-visor-nav" id="cmVisorSiguiente" aria-label="Foto siguiente"><i class="ti ti-chevron-right"></i></button>
++                    </div>
++                    <div class="cm-visor-cuerpo">
++                        <div class="cm-visor-img" id="cmVisorImg">
++                            <img id="cmVisorFoto" alt="">
++                            <img id="cmVisorMapa" class="cm-img-mapa" alt="">
++                            <div class="cm-vista cm-vista-flotante" id="cmVisorVista" role="group" aria-label="Ver la foto o el mapa de calor">
++                                <button type="button" class="active" data-cm-vista="foto" aria-pressed="true">Foto</button>
++                                <button type="button" data-cm-vista="mapa" aria-pressed="false">Mapa de calor</button>
++                            </div>
++                        </div>
++                        <div class="cm-visor-info">
++                            <span class="cm-etiqueta en-linea" id="cmVisorEtiqueta"></span>
++                            <p class="cm-visor-texto" id="cmVisorTexto"></p>
++                            <div class="cm-side-label ms-0">Opciones más probables</div>
++                            <div class="cm-clases mb-3" id="cmVisorTop"></div>
++                            <div class="cm-side-label ms-0">Calidad de esta foto</div>
++                            <div class="cm-clases mb-3" id="cmVisorCalidad"></div>
++                            <ul class="cm-lista cm-visor-avisos" id="cmVisorAvisos"></ul>
++                        </div>
++                    </div>
++                </div>
++            </section>
++        </div>
++    </div>
++</div>
++@endsection
++
+ @section('scripts')
+ <script src="{{ asset('build/assets/libs/sweetalert2/sweetalert2.min.js') }}"></script>
+ <script>
+ document.addEventListener('DOMContentLoaded', function () {
+     const BURST_TOTAL = 5;
++    const URL_ANALIZAR = @json(route('coca-reconocimiento.analizar'));
++    const CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+ 
+     const stage = document.getElementById('camStage');
+     const video = document.getElementById('camVideo');
+@@ -1151,9 +1937,23 @@ function capturarFrame() {
+             ctx.scale(-1, 1);
+         }
+         ctx.drawImage(video, 0, 0, c.width, c.height);
++        c.recorteMarco = regionDelMarco(); // lo que el usuario veía dentro del marco
+         return c;
+     }
+ 
++    // Región de la foto que se ve dentro del marco de escaneo. La cámara se
++    // muestra con object-fit: cover (centrada) y el marco tiene inset: 9%.
++    function regionDelMarco() {
++        const vw = video.videoWidth, vh = video.videoHeight;
++        const sw = stage.clientWidth, sh = stage.clientHeight;
++        if (!vw || !vh || !sw || !sh) return null;
++
++        const escala = Math.max(sw / vw, sh / vh);
++        const w = (sw / escala) * 0.82;
++        const h = (sh / escala) * 0.82;
++        return { x: (vw - w) / 2, y: (vh - h) / 2, w: w, h: h };
++    }
++
+     function dispararFlash() {
+         camFlash.classList.remove('fire');
+         void camFlash.offsetWidth;
+@@ -1223,99 +2023,101 @@ function miniatura(canvasSrc, ancho) {
+ 
+     document.getElementById('retakeBtn').addEventListener('click', () => startCamera());
+ 
+-    nuevaCapturaBtn.addEventListener('click', () => {
++    function nuevaCaptura() {
+         resultadoContenido.classList.add('d-none');
+         resultadoPlaceholder.classList.remove('d-none');
+         nuevaCapturaBtn.classList.add('d-none');
+         startCamera();
+         stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+-    });
++    }
+ 
+-    // ==================== Análisis en el dispositivo ====================
+-    // Analiza los píxeles de cada foto: cobertura verde, intensidad,
+-    // iluminación y nitidez. Sin IA todavía (se conectará después).
+-    function analizarPixeles(canvasSrc) {
+-        const W = 320;
+-        const H = Math.round(W * canvasSrc.height / canvasSrc.width) || 240;
++    nuevaCapturaBtn.addEventListener('click', nuevaCaptura);
++
++    // ==================== Análisis con la red neuronal (API) ====================
++    const ESTADOS = {
++        confirmado:     { etiqueta: 'Confirmado',        alerta: 'alert-success',   icono: 'ti-circle-check', toast: 'success' },
++        probable:       { etiqueta: 'Probable',          alerta: 'alert-warning',   icono: 'ti-alert-circle', toast: 'warning' },
++        no_concluyente: { etiqueta: 'No concluyente',    alerta: 'alert-secondary', icono: 'ti-help-circle',  toast: 'warning' },
++        rechazado:      { etiqueta: 'No es hoja de coca', alerta: 'alert-danger',   icono: 'ti-circle-x',     toast: 'error' },
++    };
++
++    const TEXTOS_PASOS = [
++        '',
++        'Subiendo las fotos de forma segura…',
++        'La red neuronal está clasificando la hoja…',
++        'Cruzando los resultados de las fotos…',
++        'Casi listo…',
++    ];
++
++    // Recorta la foto al marco, la reduce a 1024 px y la convierte a JPEG
++    function fotoParaEnviar(canvasSrc) {
++        const r = canvasSrc.recorteMarco || { x: 0, y: 0, w: canvasSrc.width, h: canvasSrc.height };
++        const escala = Math.min(1, 1024 / Math.max(r.w, r.h));
+         const c = document.createElement('canvas');
+-        c.width = W; c.height = H;
++        c.width = Math.max(1, Math.round(r.w * escala));
++        c.height = Math.max(1, Math.round(r.h * escala));
+         const ctx = c.getContext('2d');
+-        ctx.drawImage(canvasSrc, 0, 0, W, H);
+-        const data = ctx.getImageData(0, 0, W, H).data;
+-
+-        let verdes = 0, total = 0, sumBrillo = 0, sumVerdeInt = 0;
+-        let prevLuma = null, sumEdge = 0, edgeCount = 0;
+-
+-        for (let y = 0; y < H; y += 2) {
+-            for (let x = 0; x < W; x += 2) {
+-                const i = (y * W + x) * 4;
+-                const r = data[i], g = data[i + 1], b = data[i + 2];
+-                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+-                total++;
+-                sumBrillo += luma;
+-
+-                const esVerde = g > 60 && g > r * 1.12 && g > b * 1.12;
+-                if (esVerde) {
+-                    verdes++;
+-                    sumVerdeInt += (g - Math.max(r, b));
+-                }
+-
+-                if (prevLuma !== null) {
+-                    sumEdge += Math.abs(luma - prevLuma);
+-                    edgeCount++;
+-                }
+-                prevLuma = luma;
+-            }
+-            prevLuma = null;
+-        }
++        ctx.imageSmoothingQuality = 'high';
++        ctx.drawImage(canvasSrc, r.x, r.y, r.w, r.h, 0, 0, c.width, c.height);
+ 
+-        return {
+-            cobertura: total ? (verdes / total) * 100 : 0,
+-            brillo: total ? (sumBrillo / total) / 255 * 100 : 0,
+-            verdeInt: verdes ? Math.min(100, (sumVerdeInt / verdes) / 90 * 100) : 0,
+-            nitidez: edgeCount ? Math.min(100, (sumEdge / edgeCount) / 28 * 100) : 0,
+-        };
++        return new Promise((resolve, reject) => {
++            c.toBlob(b => b ? resolve(b) : reject(new Error('No se pudo preparar una de las fotos.')), 'image/jpeg', 0.9);
++        });
+     }
+ 
+-    function promediarMetricas(lista) {
+-        const avg = key => lista.reduce((s, m) => s + m[key], 0) / lista.length;
++    // Avanza los pasos del overlay mientras el servidor responde
++    function avanzarPasos(pasos, desde) {
++        let i = desde;
++        pasos[i].classList.add('active');
++        analisisFotoProgreso.textContent = TEXTOS_PASOS[i] || '';
+ 
+-        // Consistencia: qué tan parecidas son las 5 fotos entre sí
+-        const cobs = lista.map(m => m.cobertura);
+-        const media = avg('cobertura');
+-        const varianza = cobs.reduce((s, v) => s + Math.pow(v - media, 2), 0) / cobs.length;
+-        const consistencia = Math.max(0, Math.min(100, 100 - Math.sqrt(varianza) * 4));
++        const timer = setInterval(() => {
++            if (i >= pasos.length - 1) return;
++            pasos[i].classList.remove('active');
++            pasos[i].classList.add('done');
++            i++;
++            pasos[i].classList.add('active');
++            analisisFotoProgreso.textContent = TEXTOS_PASOS[i] || '';
++        }, 1200);
+ 
+-        return {
+-            cobertura: avg('cobertura'),
+-            brillo: avg('brillo'),
+-            verdeInt: avg('verdeInt'),
+-            nitidez: avg('nitidez'),
+-            consistencia,
++        return () => {
++            clearInterval(timer);
++            pasos.forEach(p => { p.classList.remove('active'); p.classList.add('done'); });
+         };
+     }
+ 
+-    function construirResultado(m) {
+-        const hojaDetectada = m.cobertura >= 12;
++    async function enviarAnalisis(fotos) {
++        const datos = new FormData();
++        fotos.forEach((blob, i) => datos.append('imagenes[]', blob, 'captura_' + (i + 1) + '.jpg'));
+ 
+-        let confianza, tipo, calidad;
+-        if (!hojaDetectada) {
+-            confianza = Math.max(8, Math.round(m.cobertura * 2));
+-            tipo = 'Hoja no detectada';
+-            calidad = 'Captura nuevamente';
+-        } else {
+-            confianza = Math.round(Math.min(96,
+-                32 + m.cobertura * 0.42 + m.verdeInt * 0.28 + m.nitidez * 0.13 + m.consistencia * 0.10
+-            ));
+-            tipo = 'Hoja de Coca';
+-
+-            const score = m.verdeInt * 0.5 + m.nitidez * 0.25 + Math.min(m.cobertura, 60) * 0.42;
+-            if (score >= 62)      calidad = 'Primera (Premium)';
+-            else if (score >= 44) calidad = 'Segunda (Estándar)';
+-            else                  calidad = 'Tercera (Básica)';
++        const control = new AbortController();
++        const limite = setTimeout(() => control.abort(), 120000);
++        let respuesta;
++        try {
++            respuesta = await fetch(URL_ANALIZAR, {
++                method: 'POST',
++                headers: { 'X-CSRF-TOKEN': CSRF, 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
++                body: datos,
++                credentials: 'same-origin',
++                signal: control.signal,
++            });
++        } catch (err) {
++            throw new Error(err.name === 'AbortError'
++                ? 'El análisis tardó demasiado. Revisa tu conexión e inténtalo de nuevo.'
++                : 'No se pudo conectar con el servidor. Revisa tu conexión a internet.');
++        } finally {
++            clearTimeout(limite);
+         }
+ 
+-        return { confianza, tipo, calidad, hojaDetectada };
++        let json = null;
++        try { json = await respuesta.json(); } catch (_) { /* respuesta sin JSON */ }
++
++        if (respuesta.status === 419) throw new Error('Tu sesión expiró. Recarga la página para continuar.');
++        if (respuesta.status === 403) throw new Error('No tienes permiso para usar el reconocimiento de coca.');
++        if (!respuesta.ok || !json || !json.success) {
++            throw new Error((json && json.message) || 'No se pudo analizar la hoja (error ' + respuesta.status + ').');
++        }
++        return json.resultado;
+     }
+ 
+     document.getElementById('analizarBtn').addEventListener('click', async () => {
+@@ -1333,116 +2135,504 @@ function construirResultado(m) {
+ 
+         const pasos = analisisOverlay.querySelectorAll('.analisis-step');
+         pasos.forEach(p => p.classList.remove('active', 'done'));
+-        analisisFotoProgreso.textContent = 'Procesando captura 1 de ' + capturas.length + '…';
+-
+-        // Paso 1: procesar cada captura con contador en vivo
+-        const metricasPorFoto = [];
+         pasos[0].classList.add('active');
+-        for (let i = 0; i < capturas.length; i++) {
+-            analisisFotoProgreso.textContent = 'Procesando captura ' + (i + 1) + ' de ' + capturas.length + '…';
+-            metricasPorFoto.push(analizarPixeles(capturas[i]));
+-            await espera(420);
++        let terminarPasos = null;
++
++        try {
++            // Paso 1: preparar cada captura (recorte al marco + JPEG)
++            const fotos = [];
++            for (let i = 0; i < capturas.length; i++) {
++                analisisFotoProgreso.textContent = 'Preparando captura ' + (i + 1) + ' de ' + capturas.length + '…';
++                fotos.push(await fotoParaEnviar(capturas[i]));
++            }
++            pasos[0].classList.remove('active');
++            pasos[0].classList.add('done');
++
++            // Pasos 2-5: el servidor analiza las fotos
++            terminarPasos = avanzarPasos(pasos, 1);
++            const resultado = await enviarAnalisis(fotos);
++            terminarPasos();
++            await espera(350);
++            mostrarResultado(resultado, fotos);
++        } catch (err) {
++            if (terminarPasos) terminarPasos();
++            mostrarError(err.message || 'No se pudo completar el análisis.');
++        } finally {
++            analisisOverlay.classList.add('d-none');
++            stage.classList.remove('analyzing');
++            analizando = false;
+         }
+-        pasos[0].classList.remove('active');
+-        pasos[0].classList.add('done');
+-
+-        // Pasos 2-5: secuencia visual
+-        const textosProgreso = [
+-            'Midiendo tonos de verde…',
+-            'Detectando bordes y textura…',
+-            'Cruzando datos de las 5 fotos…',
+-            'Casi listo…',
+-        ];
+-        for (let i = 1; i < pasos.length; i++) {
+-            analisisFotoProgreso.textContent = textosProgreso[i - 1] || '';
+-            pasos[i].classList.add('active');
+-            await espera(620 + Math.random() * 320);
+-            pasos[i].classList.remove('active');
+-            pasos[i].classList.add('done');
++    });
++
++    function mostrarError(mensaje) {
++        resultadoContenido.classList.add('d-none');
++        resultadoPlaceholder.classList.remove('d-none');
++
++        if (typeof Swal !== 'undefined') {
++            Swal.fire({ icon: 'error', title: 'No se pudo analizar', text: mensaje, confirmButtonText: 'Entendido' });
++        } else if (typeof window.adepToast === 'function') {
++            window.adepToast('error', 'No se pudo analizar', mensaje);
++        } else {
++            alert(mensaje);
++        }
++    }
++
++    // ==================== Modal «Análisis completo» ====================
++    const ESTADO_CHIP = { confirmado: 'Confirmado', probable: 'Probable', no_concluyente: 'No concluyente', rechazado: 'Rechazado' };
++    const MARCA = {
++        confirmado: ['ti-leaf', ''], probable: ['ti-leaf', 't-alerta'],
++        no_concluyente: ['ti-help-circle', 't-neutro'], rechazado: ['ti-ban', 't-mal'],
++    };
++    const SECCIONES = { fotos: 'Fotos analizadas', metricas: 'Métricas del análisis', informe: 'Informe de la red neuronal' };
++    const METRICAS = [
++        ['confianza_modelo', 'Confianza de la red neuronal', 'ti-brain', 'Qué tan segura está la red del resultado.'],
++        ['consistencia', 'Consistencia entre fotos', 'ti-arrows-diff', 'Qué parte de las fotos señala el mismo resultado.'],
++        ['similitud_dataset', 'Similitud con el entrenamiento', 'ti-leaf', 'Cuánto se parecen tus fotos a las hojas con las que aprendió la red.'],
++        ['iluminacion', 'Iluminación', 'ti-sun', 'Luz de las fotos: ni muy oscuras ni quemadas.'],
++        ['nitidez', 'Nitidez', 'ti-focus-2', 'Enfoque de las fotos: sin movimiento ni desenfoque.'],
++    ];
++
++    const modalEl = document.getElementById('cocaResultadoModal');
++    document.body.appendChild(modalEl); // directo en <body>: el modal no queda atrapado en las capas de la página
++    const visor = document.getElementById('cmVisor');
++    let resultadoActual = null;
++    let urlsFotos = [];      // fotos enviadas a la red (recortadas al marco)
++    let vista = 'foto';      // 'foto' o 'mapa' (mapa de calor)
++    let visorIdx = -1;
++    let verTodasClases = false;
++    let iniciarTrasCerrar = false;
++
++    const pct = v => Math.round(Math.min(100, Math.max(0, Number(v) || 0)));
++    const pctTexto = v => { const n = Math.min(100, Math.max(0, Number(v) || 0)); return (n > 0 && n < 10 ? n.toFixed(1) : Math.round(n)) + '%'; };
++    const nivel = v => v >= 70 ? ['ok', 'Alta'] : (v >= 40 ? ['alerta', 'Media'] : ['mal', 'Baja']);
++    const mapaValido = m => (typeof m === 'string' && m.startsWith('data:image/jpeg;base64,')) ? m : null;
++    const urlFoto = indice => urlsFotos[indice - 1] || null;
++
++    // Crea un elemento; el texto siempre va como texto, nunca como HTML
++    function el(etiqueta, clase, texto) {
++        const n = document.createElement(etiqueta);
++        if (clase) n.className = clase;
++        if (texto !== undefined && texto !== null) n.textContent = texto;
++        return n;
++    }
++
++    const icono = nombre => el('i', 'ti ' + nombre);
++
++    // Barra de segmentos [[valor, tono]]; el ancho se anima al mostrarse
++    function barra(segmentos) {
++        const b = el('div', 'cm-barra');
++        segmentos.forEach(([valor, tono]) => {
++            const s = el('span', 't-' + tono);
++            s.dataset.w = Math.min(100, Math.max(0, Number(valor) || 0));
++            b.appendChild(s);
++        });
++        return b;
++    }
++
++    function animarBarras(raiz) {
++        const barras = raiz.querySelectorAll('.cm-barra > span');
++        barras.forEach(s => { s.style.width = '0'; });
++        requestAnimationFrame(() => requestAnimationFrame(() => {
++            barras.forEach(s => { s.style.width = s.dataset.w + '%'; });
++        }));
++    }
++
++    // Filas «nombre · % · barra» (probabilidad por tipo, top 3 y calidad de una foto)
++    function filas(contenedor, datos) {
++        contenedor.replaceChildren(...datos.map(([nombre, valor, tono, ganadora]) => {
++            const fila = el('div', 'cm-fila' + (ganadora ? ' es-ganadora' : ''));
++            const top = el('div', 'cm-fila-top');
++            top.append(el('span', null, nombre), el('b', null, pctTexto(valor)));
++            fila.append(top, barra([[valor, tono]]));
++            return fila;
++        }));
++    }
++
++    function pintarLista(idLista, idCaja, items, claseIcono) {
++        const lista = document.getElementById(idLista);
++        lista.replaceChildren(...(Array.isArray(items) ? items : []).map(texto => {
++            const li = el('li');
++            li.append(icono(claseIcono), el('span', null, String(texto)));
++            return li;
++        }));
++        document.getElementById(idCaja).classList.toggle('d-none', lista.children.length === 0);
++    }
++
++    // Verde = coincide con el resultado; rojo = no es coca o no coincide; ámbar = parece coca en un análisis rechazado
++    function etiqueta(span, f, rechazado, extra) {
++        const [clase, ico] = !f.es_hoja_de_coca ? ['es-mal', 'ti-ban']
++            : (rechazado ? ['es-duda', 'ti-help'] : (f.coincide ? ['', 'ti-check'] : ['es-mal', 'ti-ban']));
++        span.className = ['cm-etiqueta', clase, extra].filter(Boolean).join(' ');
++        span.replaceChildren(el('span', null, f.clase || '—'), icono(ico));
++    }
++
++    function crearTile(f, rechazado, orden, posicion) {
++        const boton = el('button', 'cm-tile');
++        boton.type = 'button';
++        boton.style.setProperty('--i', orden);
++        boton.dataset.indice = f.indice;
++        boton.setAttribute('aria-label', 'Foto ' + f.indice + ': ' + f.clase + ', ' + pct(f.confianza) + '%. Ver detalle');
++
++        const foto = urlFoto(f.indice), mapa = mapaValido(f.mapa_atencion);
++        if (foto || mapa) {
++            const img = el('img', foto && mapa ? 'cm-img-foto' : 'cm-img-unica');
++            img.src = foto || mapa;
++            img.alt = '';
++            boton.appendChild(img);
++            if (foto && mapa) {
++                const imgMapa = el('img', 'cm-img-mapa');
++                imgMapa.src = mapa;
++                imgMapa.alt = '';
++                boton.appendChild(imgMapa);
++            }
++        } else {
++            const vacio = el('span', 'cm-sin-foto');
++            vacio.appendChild(icono('ti-photo-off'));
++            boton.appendChild(vacio);
++        }
++
++        const chip = el('span', 'cm-chip izq' + (f.fuera_de_distribucion ? ' ajena' : ''));
++        if (f.fuera_de_distribucion) chip.append(icono('ti-alert-triangle'), 'Foto ' + f.indice + ' · ajena');
++        else chip.textContent = 'Foto ' + f.indice;
++        const badge = el('span');
++        etiqueta(badge, f, rechazado);
++        boton.append(chip, el('span', 'cm-chip der', pct(f.confianza) + '%'), badge);
++        boton.addEventListener('click', () => abrirVisor(posicion));
++        return boton;
++    }
++
++    function pintarModal(res, horaTexto) {
++        resultadoActual = res;
++        const clave = ESTADOS[res.estado] ? res.estado : 'no_concluyente';
++        const rechazado = clave === 'rechazado';
++        const fotos = Array.isArray(res.por_imagen) ? res.por_imagen : [];
++        const total = fotos.length;
++        const coinciden = fotos.filter(f => f.coincide), resto = fotos.filter(f => !f.coincide);
++        const pctA = total ? Math.round(coinciden.length / total * 100) : 0;
++        const pctB = total ? 100 - pctA : 0;
++        const titulo = res.tipo || (rechazado ? 'No es hoja de coca' : 'No identificado');
++
++        // Lateral: resultado, «Todas las fotos», probabilidad por tipo y resumen
++        document.getElementById('cmTitulo').textContent = titulo;
++        const chip = document.getElementById('cmEstado');
++        chip.textContent = ESTADO_CHIP[clave];
++        chip.className = 'cm-estado is-' + clave;
++        document.getElementById('cmConfianza').textContent = pct(res.confianza) + '% de confianza';
++        const marca = document.getElementById('cmMarcaIco');
++        marca.className = 'cm-marca-ico ' + MARCA[clave][1];
++        marca.replaceChildren(icono(MARCA[clave][0]));
++        document.getElementById('cmNavFotos').textContent = total;
++
++        const top = el('div', 'cm-fila-top');
++        top.append(el('span', null, 'Todas las fotos'), el('b', null, pctA + '%'));
++        document.getElementById('cmGeneral').replaceChildren(top,
++            barra([[pctA, rechazado ? 'mal' : 'ok'], [pctB, rechazado ? 'alerta' : 'mal']]));
++        pintarClases();
++
++        const resumen = document.getElementById('cmResumen');
++        resumen.replaceChildren();
++        if (total && rechazado) {
++            resumen.append(el('b', 'mal', pctA + '%'), ' de tus fotos no muestran una hoja de coca');
++            if (resto.length) resumen.append('; ', el('b', 'alerta', pctB + '%'), ' sí se parecen a una');
++            resumen.append('.');
++        } else if (total) {
++            resumen.append(el('b', 'ok', pctA + '%'), ' de tus fotos coinciden con «' + titulo + '»');
++            if (resto.length) resumen.append(', ', el('b', 'mal', pctB + '%'), ' no');
++            resumen.append('.');
++        }
++        const ajenas = fotos.filter(f => f.fuera_de_distribucion).length;
++        if (ajenas) {
++            resumen.append(' ', el('b', 'alerta', ajenas + (ajenas === 1 ? ' foto' : ' fotos')),
++                ajenas === 1 ? ' no se parece a las del entrenamiento.' : ' no se parecen a las del entrenamiento.');
++        }
++
++        document.getElementById('cmHora').textContent = [horaTexto, total + (total === 1 ? ' foto' : ' fotos'),
++            res.tiempo_proceso ? Number(res.tiempo_proceso).toFixed(1) + ' s de análisis' : ''].filter(Boolean).join(' · ');
++
++        // Fotos agrupadas: «Coinciden / No coinciden» (o «Sin hoja de coca / Parecen hoja de coca»)
++        const grupos = document.getElementById('cmGrupos');
++        grupos.replaceChildren();
++        const nombres = rechazado ? ['Sin hoja de coca', 'Parecen hoja de coca'] : ['Coinciden', 'No coinciden'];
++        let orden = 0;
++        [[coinciden, nombres[0], pctA], [resto, nombres[1], pctB]].forEach(([lista, nombre, porcentaje]) => {
++            if (!lista.length) return;
++            const h = el('h4', 'cm-grupo-titulo', nombre);
++            h.append(el('small', null, porcentaje + '%'));
++            const grid = el('div', 'cm-grid');
++            lista.forEach(f => grid.appendChild(crearTile(f, rechazado, orden++, fotos.indexOf(f))));
++            const grupo = el('section', 'cm-grupo');
++            grupo.append(h, grid);
++            grupos.appendChild(grupo);
++        });
++        if (!total) grupos.appendChild(el('p', 'cm-vacio', 'La API no devolvió el detalle de cada foto.'));
++        modalEl.dataset.hayMapas = fotos.some(f => mapaValido(f.mapa_atencion) && urlFoto(f.indice)) ? '1' : '';
++        cambiarVista('foto');
++
++        // Métricas (0-100) con nivel alto / medio / bajo
++        const m = res.metricas || {};
++        document.getElementById('cmMetricas').replaceChildren(...METRICAS
++            .filter(([k]) => m[k] !== null && m[k] !== undefined)
++            .map(([k, nombre, ico, ayuda], i) => {
++                const valor = pct(m[k]);
++                const [tono, texto] = nivel(valor);
++                const tarjeta = el('div', 'cm-metrica');
++                tarjeta.style.setProperty('--i', i);
++                const caja = el('span', 'cm-metrica-ico t-' + tono);
++                caja.appendChild(icono(ico));
++                const textos = el('div', 'cm-min0');
++                textos.append(el('div', 'cm-metrica-nombre', nombre), el('div', 'cm-metrica-nivel cm-tono-' + tono, texto));
++                const cab = el('div', 'cm-metrica-top');
++                cab.append(caja, textos, el('div', 'cm-metrica-valor', valor + '%'));
++                tarjeta.append(cab, barra([[valor, tono]]), el('p', null, ayuda));
++                return tarjeta;
++            }));
++
++        // Informe
++        document.getElementById('cmVeredicto').className = 'cm-veredicto is-' + clave;
++        document.getElementById('cmVeredicto').replaceChildren(icono(ESTADOS[clave].icono), el('span', null, res.mensaje || ''));
++        document.getElementById('cmExplicacion').textContent = res.explicacion || '';
++        document.getElementById('cmExplicacionBox').classList.toggle('d-none', !res.explicacion);
++        pintarLista('cmRecomendaciones', 'cmRecomendacionesBox', res.recomendaciones, 'ti-circle-check');
++        pintarLista('cmAdvertencias', 'cmAdvertenciasBox', res.advertencias, 'ti-alert-triangle');
++        const modelo = res.modelo && res.modelo.arquitectura
++            ? res.modelo.arquitectura + (res.modelo.imgsz ? ' · ' + res.modelo.imgsz + ' px' : '') : 'Red neuronal convolucional';
++        document.getElementById('cmTecnico').replaceChildren(...[
++            ['Fotos analizadas', String(res.imagenes_analizadas || total)],
++            ['Tiempo de análisis', res.tiempo_proceso ? Number(res.tiempo_proceso).toFixed(1) + ' s' : '—'],
++            ['Hora', horaTexto],
++            ['Red neuronal', modelo],
++        ].map(([k, v]) => {
++            const d = el('div');
++            d.append(el('dt', null, k), el('dd', null, v));
++            return d;
++        }));
++    }
++
++    // Probabilidad por tipo: 5 en el lateral (con «ver todos») y todas en Métricas (celular)
++    function pintarClases() {
++        const tonoGanadora = resultadoActual.estado === 'rechazado' ? 'mal' : 'ok';
++        const datos = Object.entries(resultadoActual.probabilidades || {})
++            .map(([n, v]) => [n, Number(v) || 0])
++            .sort((a, b) => b[1] - a[1])
++            .map(([n, v], i) => [n, v, i === 0 ? tonoGanadora : 'suave', i === 0]);
++        filas(document.getElementById('cmClases'), verTodasClases ? datos : datos.slice(0, 5));
++        filas(document.getElementById('cmClasesMovil'), datos);
++        const boton = document.getElementById('cmVerMas');
++        boton.classList.toggle('d-none', datos.length <= 5);
++        boton.textContent = verTodasClases ? 'Ver menos' : 'Ver los ' + datos.length + ' tipos';
++    }
++
++    document.getElementById('cmVerMas').addEventListener('click', () => {
++        verTodasClases = !verTodasClases;
++        pintarClases();
++        animarBarras(document.getElementById('cmClases'));
++        animarBarras(document.getElementById('cmClasesMovil'));
++    });
++
++    function cambiarVista(nueva) {
++        vista = nueva === 'mapa' ? 'mapa' : 'foto';
++        document.getElementById('cmGrupos').classList.toggle('ver-mapa', vista === 'mapa');
++        document.getElementById('cmLeyenda').classList.toggle('d-none', vista !== 'mapa');
++        modalEl.querySelectorAll('[data-cm-vista]').forEach(b => {
++            const activo = b.dataset.cmVista === vista;
++            b.classList.toggle('active', activo);
++            b.setAttribute('aria-pressed', activo ? 'true' : 'false');
++        });
++        if (visorIdx >= 0) pintarVisor();
++    }
++
++    modalEl.querySelectorAll('[data-cm-vista]').forEach(b => b.addEventListener('click', () => cambiarVista(b.dataset.cmVista)));
++
++    // Pestañas: Fotos / Métricas / Informe (también con las flechas del teclado)
++    function mostrarSeccion(nombre) {
++        modalEl.querySelectorAll('[data-cm-tab]').forEach(b => {
++            const activa = b.dataset.cmTab === nombre;
++            b.classList.toggle('active', activa);
++            b.setAttribute('aria-selected', activa ? 'true' : 'false');
++            b.tabIndex = activa ? 0 : -1;
++        });
++        modalEl.querySelectorAll('.cm-panel').forEach(p => p.classList.toggle('d-none', p.dataset.panel !== nombre));
++        document.getElementById('cmSeccion').textContent = SECCIONES[nombre];
++        document.getElementById('cmVistaControl').classList.toggle('d-none', nombre !== 'fotos' || !modalEl.dataset.hayMapas);
++        document.getElementById('cmCuerpo').scrollTop = 0;
++        const app = modalEl.querySelector('.cm-app'), nav = modalEl.querySelector('.cm-nav');
++        if (app.scrollTop > nav.offsetTop) app.scrollTop = nav.offsetTop; // celular: la sección empieza arriba
++        animarBarras(modalEl.querySelector('.cm-panel[data-panel="' + nombre + '"]'));
++    }
++
++    const pestanas = [...modalEl.querySelectorAll('[data-cm-tab]')];
++    pestanas.forEach((b, i) => {
++        b.addEventListener('click', () => mostrarSeccion(b.dataset.cmTab));
++        b.addEventListener('keydown', e => {
++            const paso = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
++            if (!paso) return;
++            e.preventDefault();
++            const otra = pestanas[(i + paso + pestanas.length) % pestanas.length];
++            otra.focus();
++            mostrarSeccion(otra.dataset.cmTab);
++        });
++    });
++
++    // Detalle de una foto: imagen grande, sus 3 opciones más probables y su calidad
++    function abrirVisor(posicion) {
++        if (!resultadoActual || !(resultadoActual.por_imagen || [])[posicion]) return;
++        visorIdx = posicion;
++        pintarVisor();
++        visor.classList.remove('d-none');
++        document.getElementById('cmVisorVolver').focus();
++    }
++
++    function cerrarVisor() {
++        if (visorIdx < 0) return;
++        const indice = Number(resultadoActual.por_imagen[visorIdx].indice);
++        visor.classList.add('d-none');
++        visorIdx = -1;
++        const tile = modalEl.querySelector('.cm-tile[data-indice="' + indice + '"]');
++        if (tile) tile.focus();
++    }
++
++    function moverVisor(paso) {
++        const nuevo = visorIdx + paso;
++        if (nuevo >= 0 && nuevo < resultadoActual.por_imagen.length) {
++            visorIdx = nuevo;
++            pintarVisor();
++        }
++    }
++
++    function pintarVisor() {
++        const fotos = resultadoActual.por_imagen;
++        const f = fotos[visorIdx];
++        const foto = urlFoto(f.indice), mapa = mapaValido(f.mapa_atencion);
++        const fijar = (img, src) => {
++            if (src) img.src = src; else img.removeAttribute('src');
++            img.classList.toggle('d-none', !src);
++        };
++
++        document.getElementById('cmVisorTitulo').textContent = 'Foto ' + f.indice + ' de ' + fotos.length;
++        const imgFoto = document.getElementById('cmVisorFoto');
++        fijar(imgFoto, foto || mapa);
++        imgFoto.alt = 'Foto ' + f.indice;
++        fijar(document.getElementById('cmVisorMapa'), foto && mapa ? mapa : null);
++        document.getElementById('cmVisorVista').classList.toggle('d-none', !(foto && mapa));
++        document.getElementById('cmVisorImg').classList.toggle('ver-mapa', vista === 'mapa' && !!(foto && mapa));
++
++        etiqueta(document.getElementById('cmVisorEtiqueta'), f, resultadoActual.estado === 'rechazado', 'en-linea');
++        document.getElementById('cmVisorTexto').textContent = pctTexto(f.confianza) + ' de confianza en esta foto. ' +
++            (f.coincide ? 'Coincide con el resultado final.' : 'No coincide con el resultado final («' + (resultadoActual.tipo || '') + '»).');
++        filas(document.getElementById('cmVisorTop'), (Array.isArray(f.top) ? f.top : []).map((t, i) =>
++            [String(t.nombre || ''), Number(t.probabilidad) || 0, i === 0 ? (f.es_hoja_de_coca ? 'ok' : 'mal') : 'suave', i === 0]));
++        filas(document.getElementById('cmVisorCalidad'), [['Iluminación', f.iluminacion], ['Nitidez', f.nitidez],
++            ['Similitud con el entrenamiento', f.similitud]]
++            .filter(([, v]) => v !== null && v !== undefined)
++            .map(([n, v]) => [n, v, nivel(pct(v))[0], false]));
++
++        const avisos = (f.fuera_de_distribucion ? ['No se parece a las fotos del entrenamiento (otro objeto, fondo o luz muy distinta).'] : [])
++            .concat(Array.isArray(f.advertencias) ? f.advertencias : []);
++        document.getElementById('cmVisorAvisos').replaceChildren(...avisos.map(t => {
++            const li = el('li');
++            li.append(icono('ti-alert-triangle'), el('span', null, String(t)));
++            return li;
++        }));
++        document.getElementById('cmVisorAnterior').disabled = visorIdx === 0;
++        document.getElementById('cmVisorSiguiente').disabled = visorIdx === fotos.length - 1;
++        animarBarras(visor);
++    }
++
++    document.getElementById('cmVisorVolver').addEventListener('click', cerrarVisor);
++    document.getElementById('cmVisorAnterior').addEventListener('click', () => moverVisor(-1));
++    document.getElementById('cmVisorSiguiente').addEventListener('click', () => moverVisor(1));
++
++    // Con el detalle abierto: Esc vuelve a las fotos (sin cerrar el modal) y las flechas cambian de foto
++    modalEl.addEventListener('keydown', e => {
++        if (visorIdx < 0) return;
++        const accion = { Escape: cerrarVisor, ArrowLeft: () => moverVisor(-1), ArrowRight: () => moverVisor(1) }[e.key];
++        if (!accion) return;
++        e.preventDefault();
++        e.stopPropagation();
++        accion();
++    }, true);
++
++    modalEl.addEventListener('show.bs.modal', () => document.body.classList.add('coca-modal-abierto'));
++    modalEl.addEventListener('shown.bs.modal', () => animarBarras(modalEl));
++    modalEl.addEventListener('hidden.bs.modal', () => {
++        document.body.classList.remove('coca-modal-abierto');
++        visor.classList.add('d-none');
++        visorIdx = -1;
++        if (iniciarTrasCerrar) {
++            iniciarTrasCerrar = false;
++            nuevaCaptura();
+         }
++    });
+ 
+-        const metricas = promediarMetricas(metricasPorFoto);
+-        const res = construirResultado(metricas);
++    function abrirModal() {
++        if (!resultadoActual || !window.bootstrap || !window.bootstrap.Modal) return false;
++        mostrarSeccion('fotos');
++        window.bootstrap.Modal.getOrCreateInstance(modalEl).show();
++        return true;
++    }
+ 
+-        analisisOverlay.classList.add('d-none');
+-        stage.classList.remove('analyzing');
+-        mostrarResultado(res, metricas);
+-        analizando = false;
++    document.getElementById('verAnalisisBtn').addEventListener('click', abrirModal);
++    document.getElementById('cmNuevaCaptura').addEventListener('click', () => {
++        iniciarTrasCerrar = true;
++        window.bootstrap.Modal.getOrCreateInstance(modalEl).hide();
+     });
+ 
+-    function mostrarResultado(res, m) {
+-        resultadoContenido.classList.remove('d-none');
++    // Resumen en la tarjeta de la página y análisis completo en el modal
++    function mostrarResultado(res, fotos) {
++        const clave = ESTADOS[res.estado] ? res.estado : 'no_concluyente';
++        const estado = ESTADOS[clave];
++        const confianza = pct(res.confianza);
++        const horaTexto = new Date().toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit' });
++
++        resultadoPlaceholder.classList.add('d-none');
++        resultadoContenido.classList.remove('d-none', 'fade-up');
++        void resultadoContenido.offsetWidth;
+         resultadoContenido.classList.add('fade-up');
+         nuevaCapturaBtn.classList.remove('d-none');
+ 
+-        document.getElementById('resTipo').textContent = res.tipo;
+-        document.getElementById('resCalidad').textContent = res.calidad;
+-        document.getElementById('resHora').textContent = new Date().toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit' });
+-
+-        // Pila de las 5 miniaturas
+-        const stack = document.getElementById('resStack');
+-        stack.innerHTML = '';
+-        capturas.forEach((c, idx) => {
+-            const img = document.createElement('img');
++        document.getElementById('resTipo').textContent = clave === 'rechazado' ? 'Hoja no reconocida' : (res.tipo || 'No identificado');
++        const badge = document.getElementById('resCalidad');
++        badge.textContent = estado.etiqueta;
++        badge.className = 'badge fw-bold px-3 py-2 rounded-pill shadow-sm estado-badge estado-' + clave;
++        document.getElementById('resHora').textContent = horaTexto +
++            (res.tiempo_proceso ? ' · ' + Number(res.tiempo_proceso).toFixed(1) + ' s' : '');
++        const total = res.imagenes_analizadas || capturas.length;
++        document.getElementById('resCapturas').textContent = total + (total === 1 ? ' captura analizada' : ' capturas analizadas');
++
++        document.getElementById('resStack').replaceChildren(...capturas.map((c, idx) => {
++            const img = el('img');
+             img.src = miniatura(c, 92);
+             img.alt = 'Captura ' + (idx + 1);
+-            stack.appendChild(img);
+-        });
++            return img;
++        }));
+ 
+-        // Anillo de confianza animado
++        // Anillo y contador de confianza animados
+         const ring = document.getElementById('confRing');
+         const circunferencia = 339.3;
+         ring.style.strokeDashoffset = circunferencia;
+-        setTimeout(() => {
+-            ring.style.strokeDashoffset = circunferencia * (1 - res.confianza / 100);
+-        }, 80);
+-
+-        // Contador animado
++        setTimeout(() => { ring.style.strokeDashoffset = circunferencia * (1 - confianza / 100); }, 80);
+         const confEl = document.getElementById('resConfianza');
+         let actual = 0;
+-        const intervalo = setInterval(() => {
+-            actual += Math.max(1, Math.round(res.confianza / 30));
+-            if (actual >= res.confianza) { actual = res.confianza; clearInterval(intervalo); }
+-            confEl.textContent = actual + '%';
+-        }, 40);
+-
+-        // Métricas con barras
+-        const defs = [
+-            { icono: 'ti-leaf',         nombre: 'Cobertura de hoja',          valor: m.cobertura,    color: '#1a6b3d' },
+-            { icono: 'ti-color-swatch', nombre: 'Intensidad de verde',        valor: m.verdeInt,     color: '#2ecc71' },
+-            { icono: 'ti-sun',          nombre: 'Iluminación',                valor: m.brillo,       color: '#f0c541' },
+-            { icono: 'ti-focus-2',      nombre: 'Nitidez',                    valor: m.nitidez,      color: '#0d4f2b' },
+-            { icono: 'ti-arrows-diff',  nombre: 'Consistencia entre fotos',   valor: m.consistencia, color: '#6366f1' },
+-        ];
+-
+-        const cont = document.getElementById('metricas');
+-        cont.innerHTML = '';
+-        defs.forEach((d, idx) => {
+-            const v = Math.round(Math.min(100, Math.max(0, d.valor)));
+-            const item = document.createElement('div');
+-            item.className = 'metrica-item d-flex align-items-center gap-3';
+-            item.innerHTML =
+-                '<span class="avatar avatar-sm rounded-circle flex-shrink-0" style="background:' + d.color + '1a; color:' + d.color + ';">' +
+-                    '<i class="ti ' + d.icono + '"></i></span>' +
+-                '<div class="flex-grow-1">' +
+-                    '<div class="d-flex justify-content-between align-items-center">' +
+-                        '<span class="fs-13 fw-semibold">' + d.nombre + '</span>' +
+-                        '<span class="fs-13 fw-bold" style="color:' + d.color + ';">' + v + '%</span>' +
+-                    '</div>' +
+-                    '<div class="metrica-bar"><div style="background: linear-gradient(90deg,' + d.color + ', ' + d.color + 'cc);"></div></div>' +
+-                '</div>';
+-            cont.appendChild(item);
+-
+-            setTimeout(() => {
+-                item.classList.add('show');
+-                item.querySelector('.metrica-bar > div').style.width = v + '%';
+-            }, 150 + idx * 130);
+-        });
++        confEl.textContent = '0%';
++        if (confianza > 0) {
++            const intervalo = setInterval(() => {
++                actual += Math.max(1, Math.round(confianza / 30));
++                if (actual >= confianza) { actual = confianza; clearInterval(intervalo); }
++                confEl.textContent = actual + '%';
++            }, 40);
++        }
+ 
+-        if (typeof window.adepToast === 'function') {
+-            window.adepToast(res.hojaDetectada ? 'success' : 'warning',
+-                res.hojaDetectada ? 'Análisis completado' : 'Hoja no detectada',
+-                res.hojaDetectada ? 'Se analizaron las 5 capturas correctamente.' : 'Vuelve a capturar con la hoja centrada.');
++        const alerta = document.getElementById('resMensaje');
++        alerta.className = 'alert border-0 shadow-sm d-flex align-items-start gap-2 mb-3 fs-12 ' + estado.alerta;
++        alerta.querySelector('i').className = 'ti ' + estado.icono + ' fs-16 mt-1 flex-shrink-0';
++        alerta.querySelector('span').textContent = res.mensaje || '';
++
++        urlsFotos.forEach(u => URL.revokeObjectURL(u));
++        urlsFotos = (fotos || []).map(b => URL.createObjectURL(b));
++        verTodasClases = false;
++        pintarModal(res, horaTexto);
++        if (!abrirModal() && typeof window.adepToast === 'function') {
++            window.adepToast(estado.toast, clave === 'confirmado' ? 'Análisis completado' : estado.etiqueta, res.mensaje || '');
+         }
+     }
+ 

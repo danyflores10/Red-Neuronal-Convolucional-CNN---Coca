@@ -1,0 +1,12 @@
+Capa,Bloque,Qué hace,Salida (canales×alto×ancho),Parámetros
+0,Conv,Convolución 3×3 + BatchNorm + SiLU,64×160×160,1856
+1,Conv,Convolución 3×3 + BatchNorm + SiLU,128×80×80,73984
+2,C3k2,Convoluciones CSP residuales,256×80×80,173824
+3,Conv,Convolución 3×3 + BatchNorm + SiLU,256×40×40,590336
+4,C3k2,Convoluciones CSP residuales,512×40×40,691712
+5,Conv,Convolución 3×3 + BatchNorm + SiLU,512×20×20,2360320
+6,C3k2,Convoluciones CSP residuales,512×20×20,2234368
+7,Conv,Convolución 3×3 + BatchNorm + SiLU,512×10×10,2360320
+8,C3k2,Convoluciones CSP residuales,512×10×10,2234368
+9,C2PSA,Convoluciones + atención espacial,512×10×10,1455616
+10,Classify,Conv 1×1 → promedio global → lineal → softmax,1000,1938920

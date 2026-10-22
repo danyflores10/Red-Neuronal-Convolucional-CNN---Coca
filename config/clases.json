@@ -1,0 +1,55 @@
+{
+  "_instrucciones": "Completa el nombre visible, la descripción y la recomendación de cada clase. La clave de cada entrada es el nombre de la clase tal como sale del modelo (la carpeta del dataset en Roboflow). No cambies las claves.",
+  "clases": {
+    "Choqueta": {
+      "nombre": "Choqueta",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "Hoja Normal": {
+      "nombre": "Hoja normal",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "Pacena": {
+      "nombre": "Paceña",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "comun": {
+      "nombre": "Común",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "hoja_especial": {
+      "nombre": "Hoja especial",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "machuqe": {
+      "nombre": "Machuqe",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "mediana_grande": {
+      "nombre": "Mediana grande",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "mediana_normal": {
+      "nombre": "Mediana normal",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "no_es_coca": {
+      "nombre": "No es hoja de coca",
+      "descripcion": "",
+      "recomendacion": ""
+    },
+    "segunda": {
+      "nombre": "Segunda",
+      "descripcion": "",
+      "recomendacion": ""
+    }
+  }
+}

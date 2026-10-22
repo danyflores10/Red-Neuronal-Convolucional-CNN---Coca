@@ -1,0 +1,19 @@
+# Configuración local y secretos
+.env
+
+# Paquete comprimido para el servidor (copia del proyecto)
+*.tar.gz
+
+# Fotos guardadas para re-entrenar y resultados de probar_api
+data/
+resultados_prueba/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Notebook
+notebooks/.ipynb_checkpoints/

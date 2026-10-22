@@ -1,0 +1,20 @@
+{
+  "_instrucciones": "Ejemplo del formato. La API crea config/clases.json automáticamente con las clases de TU modelo la primera vez que se inicia; edita ese archivo (no este). La clave de cada entrada es el nombre de la clase tal como sale del modelo (la carpeta del dataset en Roboflow). No cambies las claves.",
+  "clases": {
+    "primera": {
+      "nombre": "Primera",
+      "descripcion": "Hoja entera, de verde intenso y uniforme, sin manchas ni perforaciones.",
+      "recomendacion": "Apta para comercialización premium. Almacenar en lugar seco y ventilado."
+    },
+    "segunda": {
+      "nombre": "Segunda",
+      "descripcion": "Hoja con ligeras variaciones de color o pequeñas imperfecciones.",
+      "recomendacion": "Apta para comercialización estándar."
+    },
+    "quispinu": {
+      "nombre": "Quispiñu",
+      "descripcion": "Escribe aquí los rasgos visibles que distinguen este tipo de hoja.",
+      "recomendacion": "Escribe aquí la recomendación para el productor o comerciante."
+    }
+  }
+}

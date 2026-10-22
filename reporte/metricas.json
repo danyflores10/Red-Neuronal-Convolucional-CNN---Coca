@@ -1,0 +1,59 @@
+{
+  "validacion": {
+    "exactitud": 1.0,
+    "exactitud_balanceada": 1.0,
+    "precision_macro": 1.0,
+    "recall_macro": 1.0,
+    "f1_macro": 1.0,
+    "f1_ponderado": 1.0,
+    "kappa_cohen": 1.0,
+    "mcc": 1.0,
+    "log_loss": 0.03302861910941774,
+    "ece": 0.02774091742255471,
+    "top2": 1.0,
+    "top3": 1.0
+  },
+  "prueba": {
+    "exactitud": 0.9375,
+    "exactitud_balanceada": 0.95,
+    "precision_macro": 0.9833333333333334,
+    "recall_macro": 0.95,
+    "f1_macro": 0.9575757575757576,
+    "f1_ponderado": 0.9299242424242424,
+    "kappa_cohen": 0.9248826291079812,
+    "mcc": 0.9294107321936891,
+    "log_loss": 0.16019060492450482,
+    "ece": 0.06700542941689491,
+    "top2": 0.9375,
+    "top3": 1.0
+  },
+  "auc_por_clase": {
+    "Choqueta": 1.0,
+    "Hoja Normal": 1.0,
+    "Pacena": 1.0,
+    "comun": 1.0,
+    "hoja_especial": 1.0,
+    "machuqe": 1.0,
+    "mediana_grande": 1.0,
+    "mediana_normal": 1.0,
+    "no_es_coca": 1.0,
+    "segunda": 1.0
+  },
+  "ap_por_clase": {
+    "Choqueta": 1.0,
+    "Hoja Normal": 1.0,
+    "Pacena": 1.0,
+    "comun": 1.0,
+    "hoja_especial": 1.0,
+    "machuqe": 1.0,
+    "mediana_grande": 1.0,
+    "mediana_normal": 1.0,
+    "no_es_coca": 1.0,
+    "segunda": 1.0
+  },
+  "umbrales": {
+    "confianza_alta": 0.7,
+    "confianza_minima": 0.4,
+    "precision_objetivo": 0.98
+  }
+}

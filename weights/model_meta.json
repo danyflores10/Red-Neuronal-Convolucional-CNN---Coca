@@ -1,0 +1,132 @@
+{
+  "proyecto": "ADEPCOCA - Reconocimiento de tipos de hoja de coca",
+  "fecha_entrenamiento": "2026-10-21T15:30:43",
+  "arquitectura": "YOLO26l-cls",
+  "modelo_base": "yolo26l-cls.pt",
+  "imgsz": 320,
+  "clases": [
+    "Choqueta",
+    "Hoja Normal",
+    "Pacena",
+    "comun",
+    "hoja_especial",
+    "machuqe",
+    "mediana_grande",
+    "mediana_normal",
+    "no_es_coca",
+    "segunda"
+  ],
+  "num_clases": 10,
+  "clases_rechazo": [
+    "no_es_coca"
+  ],
+  "rechazo": {
+    "correcto": 1.0,
+    "erroneo": 0.0,
+    "negativos_agregados": "Caltech-101 + fondos vacíos"
+  },
+  "tta_recomendado": true,
+  "umbrales": {
+    "confianza_alta": 0.7,
+    "confianza_minima": 0.4,
+    "precision_objetivo": 0.98
+  },
+  "ood": {
+    "k": 10,
+    "umbral": 0.29055479168891907,
+    "percentil": 99,
+    "margen": 1.1,
+    "dimension": 512,
+    "banco": 154
+  },
+  "metricas_validacion": {
+    "exactitud": 1.0,
+    "exactitud_balanceada": 1.0,
+    "precision_macro": 1.0,
+    "recall_macro": 1.0,
+    "f1_macro": 1.0,
+    "f1_ponderado": 1.0,
+    "kappa_cohen": 1.0,
+    "mcc": 1.0,
+    "log_loss": 0.03302861910941774,
+    "ece": 0.02774091742255471,
+    "top2": 1.0,
+    "top3": 1.0
+  },
+  "metricas_test": {
+    "exactitud": 0.9375,
+    "exactitud_balanceada": 0.95,
+    "precision_macro": 0.9833333333333334,
+    "recall_macro": 0.95,
+    "f1_macro": 0.9575757575757576,
+    "f1_ponderado": 0.9299242424242424,
+    "kappa_cohen": 0.9248826291079812,
+    "mcc": 0.9294107321936891,
+    "log_loss": 0.16019060492450482,
+    "ece": 0.06700542941689491,
+    "top2": 0.9375,
+    "top3": 1.0
+  },
+  "entrenamiento": {
+    "epocas_max": 100,
+    "epocas_entrenadas": 33,
+    "mejor_epoca": 24,
+    "paciencia": 25,
+    "batch": 32,
+    "optimizador": "AdamW",
+    "lr0": 0.000714,
+    "minutos": 3.0
+  },
+  "dataset": {
+    "roboflow": {
+      "workspace": "ingeniria-de-sistemas",
+      "proyecto": "ia-hoja-de-coca-u8rgu",
+      "version": 2,
+      "tipo": "object-detection"
+    },
+    "imagenes": {
+      "train": {
+        "Choqueta": 11,
+        "Hoja Normal": 11,
+        "Pacena": 14,
+        "comun": 10,
+        "hoja_especial": 15,
+        "machuqe": 8,
+        "mediana_grande": 26,
+        "mediana_normal": 24,
+        "no_es_coca": 17,
+        "segunda": 35
+      },
+      "val": {
+        "Choqueta": 1,
+        "Hoja Normal": 1,
+        "Pacena": 7,
+        "comun": 1,
+        "hoja_especial": 4,
+        "machuqe": 1,
+        "mediana_grande": 1,
+        "mediana_normal": 1,
+        "no_es_coca": 2,
+        "segunda": 3
+      },
+      "test": {
+        "Choqueta": 1,
+        "Hoja Normal": 1,
+        "Pacena": 5,
+        "comun": 1,
+        "hoja_especial": 1,
+        "machuqe": 2,
+        "mediana_grande": 1,
+        "mediana_normal": 1,
+        "no_es_coca": 2,
+        "segunda": 1
+      }
+    }
+  },
+  "ultralytics_version": "8.4.183",
+  "versiones": {
+    "ultralytics": "8.4.183",
+    "torch": "2.11.0+cu130",
+    "python": "3.13.15"
+  }
+}

@@ -1,0 +1,18 @@
+# ============================================================
+#  API de Reconocimiento de Hoja de Coca - ADEPCOCA
+#  Dependencias de ejecución (Python 3.10 o superior)
+# ============================================================
+
+# Servidor web
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.18
+pydantic>=2.7,<3
+pydantic-settings>=2.4,<3
+
+# Red neuronal convolucional (YOLO26-cls / YOLO11-cls sobre PyTorch)
+# Usa la MISMA versión mayor de ultralytics con la que se entrenó en Colab.
+ultralytics>=8.4,<9
+numpy>=1.26
+pillow>=10.4
+pi-heif>=0.18   # fotos HEIC de iPhone (y evita que Ultralytics lo instale en caliente)
